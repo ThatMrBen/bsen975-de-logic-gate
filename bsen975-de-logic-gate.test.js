@@ -10,15 +10,25 @@ const {
   COMPONENT_DEFINITIONS
 } = require("./bsen975-de-logic-gate.js");
 
+function addLine(simulator, id1, port1, id2, port2) {
+  return simulator.createLine("", id1, port1, id2, port2);
+}
+
+function removeLineBetween(simulator, id1, port1, id2, port2) {
+  const endpoints = new Set([`${id1}.${port1}`, `${id2}.${port2}`]);
+  const line = simulator.getLines().find(({ from, to }) => endpoints.has(from) && endpoints.has(to));
+  return line ? simulator.removeLine(line.id) : false;
+}
+
 test("disconnected inputs return to zero", () => {
   const simulator = new TuringSimulator();
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect("input", "OUT", "output", "IN");
+  addLine(simulator, "input", "OUT", "output", "IN");
   simulator.setPort("input", "OUT", 1);
   simulator.tick();
 
-  simulator.disconnect("input", "OUT", "output", "IN");
+  removeLineBetween(simulator, "input", "OUT", "output", "IN");
 
   assert.equal(simulator.getPort("output", "IN"), 0);
 });
@@ -28,14 +38,14 @@ test("a second driver is rejected without changing the graph", () => {
   simulator.addComponent("a", "LEVEL_INPUT");
   simulator.addComponent("b", "LEVEL_INPUT");
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect("a", "OUT", "output", "IN");
+  addLine(simulator, "a", "OUT", "output", "IN");
 
   assert.throws(
-    () => simulator.connect("b", "OUT", "output", "IN"),
+    () => addLine(simulator, "b", "OUT", "output", "IN"),
     (error) => error instanceof CircuitError && /多个驱动端/.test(error.message)
   );
   assert.deepEqual(simulator.exportGraph().connections, [
-    { from: "a.OUT", to: "output.IN" }
+    { id: "line-1", from: "a.OUT", to: "output.IN" }
   ]);
   assert.doesNotThrow(() => simulator.tick());
 });
@@ -45,8 +55,8 @@ test("one driver can still fan out to multiple inputs", () => {
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("left", "LEVEL_OUTPUT");
   simulator.addComponent("right", "LEVEL_OUTPUT");
-  simulator.connect("input", "OUT", "left", "IN");
-  simulator.connect("input", "OUT", "right", "IN");
+  addLine(simulator, "input", "OUT", "left", "IN");
+  addLine(simulator, "input", "OUT", "right", "IN");
   simulator.setPort("input", "OUT", 1);
   simulator.tick();
 
@@ -54,11 +64,233 @@ test("one driver can still fan out to multiple inputs", () => {
   assert.equal(simulator.getPort("right", "IN"), 1);
 });
 
+test("named lines can be inspected, drawn, and removed independently", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT", 4);
+  simulator.addComponent("sink", "LEVEL_OUTPUT", 4);
+
+  assert.equal(simulator.createLine("front-wire", "source", "OUT", "sink", "IN"), "front-wire");
+  simulator.setPort("source", "OUT", 10);
+  simulator.tick();
+
+  const line = simulator.getLineInfo("front-wire");
+  assert.deepEqual(line, {
+    id: "front-wire",
+    from: "source.OUT",
+    to: "sink.IN",
+    width: 4,
+    value: 10,
+    netId: line.netId
+  });
+  assert.match(line.netId, /^net-/);
+  assert.deepEqual(simulator.getLines(), [line]);
+  assert.deepEqual(simulator.getComponentInfo("source").links, [{
+    id: "front-wire", from: "source.OUT", to: "sink.IN"
+  }]);
+
+  assert.equal(simulator.removeLine("front-wire"), true);
+  assert.deepEqual(simulator.getLines(), []);
+  assert.equal(simulator.getPort("sink", "IN"), 0);
+  assert.throws(() => simulator.getLineInfo("front-wire"), /线路不存在/);
+});
+
+test("ports accept multiple lines while direction and duplicate rules remain atomic", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT");
+  simulator.addComponent("sink", "LEVEL_OUTPUT");
+  simulator.addComponent("otherSink", "LEVEL_OUTPUT");
+  simulator.addComponent("via", "VIA");
+
+  simulator.createLine("main", "source", "OUT", "sink", "IN");
+  simulator.createLine("branch-at-input", "sink", "IN", "via", "IO");
+  simulator.createLine("branch-out", "via", "IO", "otherSink", "IN");
+  assert.equal(simulator.getLines().length, 3);
+
+  const before = simulator.exportGraph().connections;
+  assert.throws(
+    () => simulator.createLine("duplicate", "sink", "IN", "source", "OUT"),
+    /已存在线路/
+  );
+  assert.throws(
+    () => simulator.createLine("input-input", "sink", "IN", "otherSink", "IN"),
+    /方向不兼容/
+  );
+  assert.throws(
+    () => simulator.createLine("self", "via", "IO", "via", "IO"),
+    /连接到自身/
+  );
+  assert.deepEqual(simulator.exportGraph().connections, before);
+});
+
+test("direct output-output connections fail before changing automatic line numbering", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("left", "LEVEL_INPUT");
+  simulator.addComponent("right", "LEVEL_INPUT");
+  simulator.addComponent("sink", "LEVEL_OUTPUT");
+
+  assert.throws(() => simulator.createLine("", "left", "OUT", "right", "OUT"), /方向不兼容/);
+  simulator.createLine("", "left", "OUT", "sink", "IN");
+  assert.deepEqual(simulator.exportCircuit().connections, [{
+    id: "line-1", from: "left.OUT", to: "sink.IN"
+  }]);
+  assert.throws(
+    () => simulator.createLine("line-1", "right", "OUT", "sink", "IN"),
+    /线路 ID 已存在/
+  );
+});
+
+test("component removal and clear discard line endpoint indexes", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT");
+  simulator.addComponent("sink", "LEVEL_OUTPUT");
+  simulator.createLine("first", "source", "OUT", "sink", "IN");
+
+  simulator.removeComponent("sink");
+  assert.deepEqual(simulator.getLines(), []);
+  simulator.addComponent("sink", "LEVEL_OUTPUT");
+  assert.doesNotThrow(() => simulator.createLine("second", "source", "OUT", "sink", "IN"));
+
+  simulator.clear();
+  simulator.addComponent("source", "LEVEL_INPUT");
+  simulator.addComponent("sink", "LEVEL_OUTPUT");
+  assert.equal(simulator.createLine("", "source", "OUT", "sink", "IN"), "line-1");
+});
+
+test("VIA is a passive single-port junction with automatic width", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT", 4);
+  simulator.addComponent("via", "VIA", 8);
+  simulator.addComponent("left", "LEVEL_OUTPUT", 4);
+  simulator.addComponent("right", "LEVEL_OUTPUT", 4);
+
+  assert.equal(simulator.getPortWidth("via", "IO"), 0);
+  assert.deepEqual(simulator.getPortDefinitions("via"), [{
+    name: "IO", direction: "passive", width: 0, value: 0, connected: false
+  }]);
+
+  addLine(simulator, "source", "OUT", "via", "IO");
+  addLine(simulator, "via", "IO", "left", "IN");
+  addLine(simulator, "via", "IO", "right", "IN");
+  assert.equal(simulator.getPortWidth("via", "IO"), 4);
+  const viaState = simulator.exportGraph().components.find(({ id }) => id === "via");
+  assert.equal(viaState.ports.IO.width, 4);
+  assert.equal(viaState.bitWidth, 4);
+  assert.equal(simulator.getComponentInfo("via").bitWidth, 4);
+
+  simulator.setPort("source", "OUT", 11);
+  assert.equal(simulator.settle().iterations, 1);
+  assert.equal(simulator.getPort("via", "IO"), 11);
+  assert.equal(simulator.getPort("left", "IN"), 11);
+  assert.equal(simulator.getPort("right", "IN"), 11);
+  assert.equal(COMPONENT_DEFINITIONS.VIA.combinational, undefined);
+  assert.equal(Array.from(simulator._combinationalEvaluations()).length, 0);
+  assert.throws(() => simulator.setComponentWidth("via", 8), /不支持修改位宽/);
+
+  removeLineBetween(simulator, "source", "OUT", "via", "IO");
+  assert.equal(simulator.getPortWidth("via", "IO"), 4);
+  assert.equal(simulator.getPort("via", "IO"), 0);
+  assert.equal(simulator.getPort("left", "IN"), 0);
+  assert.equal(simulator.getPort("right", "IN"), 0);
+});
+
+test("VIA chains infer width and reject mixed widths atomically", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("wide", "BUS_OUTPUT");
+  simulator.addComponent("narrow", "OUTPUT");
+  simulator.addComponent("via1", "VIA");
+  simulator.addComponent("via2", "VIA");
+  addLine(simulator, "via1", "IO", "via2", "IO");
+  assert.equal(simulator.getPortWidth("via1", "IO"), 0);
+  assert.equal(simulator.getPortWidth("via2", "IO"), 0);
+
+  addLine(simulator, "wide", "IN", "via1", "IO");
+  assert.equal(simulator.getPortWidth("via1", "IO"), 8);
+  assert.equal(simulator.getPortWidth("via2", "IO"), 8);
+  const before = simulator.exportGraph().connections;
+  assert.throws(() => addLine(simulator, "narrow", "IN", "via2", "IO"), /端口位宽不匹配/);
+  assert.deepEqual(simulator.exportGraph().connections, before);
+
+  removeLineBetween(simulator, "wide", "IN", "via1", "IO");
+  assert.equal(simulator.getPortWidth("via1", "IO"), 0);
+  assert.equal(simulator.getPortWidth("via2", "IO"), 0);
+});
+
+test("VIA networks still reject multiple real drivers", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("first", "LEVEL_INPUT", 4);
+  simulator.addComponent("second", "LEVEL_INPUT", 4);
+  simulator.addComponent("via", "VIA");
+  addLine(simulator, "first", "OUT", "via", "IO");
+  const before = simulator.exportGraph().connections;
+
+  assert.throws(() => addLine(simulator, "second", "OUT", "via", "IO"), /多个驱动端/);
+  assert.deepEqual(simulator.exportGraph().connections, before);
+});
+
+test("VIA adapts to compatible resizes and isolates conflicting networks", () => {
+  const adaptable = new TuringSimulator();
+  adaptable.addComponent("source", "LEVEL_INPUT", 4);
+  adaptable.addComponent("via", "VIA");
+  addLine(adaptable, "source", "OUT", "via", "IO");
+  const kept = adaptable.setComponentWidth("source", 8);
+  assert.deepEqual(kept.disconnected, []);
+  assert.equal(adaptable.getPortWidth("via", "IO"), 8);
+  assert.equal(adaptable.exportGraph().connections.length, 1);
+
+  const conflicting = new TuringSimulator();
+  conflicting.addComponent("source", "LEVEL_INPUT", 4);
+  conflicting.addComponent("sink", "LEVEL_OUTPUT", 4);
+  conflicting.addComponent("via", "VIA");
+  addLine(conflicting, "source", "OUT", "via", "IO");
+  addLine(conflicting, "via", "IO", "sink", "IN");
+  const changed = conflicting.setComponentWidth("source", 8);
+  assert.deepEqual(changed.disconnected, [{ id: "line-1", from: "source.OUT", to: "via.IO" }]);
+  assert.equal(conflicting.getPortWidth("via", "IO"), 4);
+  assert.deepEqual(conflicting.exportGraph().connections, [{ id: "line-2", from: "via.IO", to: "sink.IN" }]);
+});
+
+test("structures require line IDs and component types must be canonical", () => {
+  const simulator = new TuringSimulator();
+  assert.throws(() => simulator.importCircuit({
+    version: 1,
+    components: [
+      { id: "source", type: "LEVEL_INPUT", width: 1 },
+      { id: "sink", type: "LEVEL_OUTPUT", width: 1 }
+    ],
+    connections: [{ from: "source.OUT", to: "sink.IN" }]
+  }), /线路 ID 不能为空/);
+  assert.deepEqual(simulator.exportCircuit().components, []);
+  assert.throws(() => simulator.addComponent("old-name", "HalfAdder"), /未知元件类型/);
+});
+
+test("VIA structure and snapshots round-trip inferred width and value", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT", 4);
+  simulator.addComponent("via", "VIA");
+  simulator.addComponent("sink", "LEVEL_OUTPUT", 4);
+  addLine(simulator, "source", "OUT", "via", "IO");
+  addLine(simulator, "via", "IO", "sink", "IN");
+  simulator.setPort("source", "OUT", 9);
+  simulator.settle();
+
+  const structure = simulator.exportCircuit();
+  assert.equal(structure.components.find(({ id }) => id === "via").width, 0);
+  const restoredStructure = new TuringSimulator();
+  restoredStructure.importCircuit(structure);
+  assert.equal(restoredStructure.getPortWidth("via", "IO"), 4);
+
+  const restoredSnapshot = new TuringSimulator();
+  restoredSnapshot.importCircuit(JSON.stringify(simulator.exportSnapshot()));
+  assert.equal(restoredSnapshot.getPortWidth("via", "IO"), 4);
+  assert.equal(restoredSnapshot.getPort("via", "IO"), 9);
+  assert.equal(restoredSnapshot.getPort("sink", "IN"), 9);
+});
+
 test("validation handles prototype-sensitive component IDs", async () => {
   const simulator = new TuringSimulator();
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("__proto__", "LEVEL_OUTPUT");
-  simulator.connect("input", "OUT", "__proto__", "IN");
+  addLine(simulator, "input", "OUT", "__proto__", "IN");
 
   const result = await simulator.validate(
     '[{"input":0}]',
@@ -80,11 +312,11 @@ test("deep acyclic circuits are not reported as oscillating", () => {
   for (let index = 0; index < 150; index++) {
     const id = `not-${index}`;
     simulator.addComponent(id, "NOT");
-    simulator.connect(previous, "OUT", id, "A");
+    addLine(simulator, previous, "OUT", id, "A");
     previous = id;
   }
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect(previous, "OUT", "output", "IN");
+  addLine(simulator, previous, "OUT", "output", "IN");
   simulator.setPort("input", "OUT", 1);
 
   assert.doesNotThrow(() => simulator.tick());
@@ -94,7 +326,7 @@ test("deep acyclic circuits are not reported as oscillating", () => {
 test("a real feedback oscillator is still rejected", () => {
   const simulator = new TuringSimulator();
   simulator.addComponent("not", "NOT");
-  simulator.connect("not", "OUT", "not", "A");
+  addLine(simulator, "not", "OUT", "not", "A");
 
   assert.throws(
     () => simulator.tick(),
@@ -145,8 +377,8 @@ test("settling and clock pulses have distinct sequential behavior", () => {
   simulator.addComponent("data", "LEVEL_INPUT", 8);
   simulator.addComponent("clock", "LEVEL_INPUT", 1);
   simulator.addComponent("register", "REGISTER");
-  simulator.connect("data", "OUT", "register", "D");
-  simulator.connect("clock", "OUT", "register", "CLK");
+  addLine(simulator, "data", "OUT", "register", "D");
+  addLine(simulator, "clock", "OUT", "register", "CLK");
   simulator.setInputs({ data: 37, clock: 1 });
 
   simulator.settle();
@@ -175,7 +407,7 @@ test("circuit import is atomic and round-trips structure", () => {
   const simulator = new TuringSimulator();
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("not", "NOT");
-  simulator.connect("input", "OUT", "not", "A");
+  addLine(simulator, "input", "OUT", "not", "A");
   const exported = simulator.exportCircuit();
 
   const restored = new TuringSimulator();
@@ -185,7 +417,7 @@ test("circuit import is atomic and round-trips structure", () => {
   assert.throws(() => restored.importCircuit({
     version: 1,
     components: [{ id: "only", type: "NOT" }],
-    connections: [{ from: "only.OUT", to: "missing.IN" }]
+    connections: [{ id: "broken-line", from: "only.OUT", to: "missing.IN" }]
   }), /元件不存在/);
   assert.deepEqual(restored.exportCircuit(), exported);
 });
@@ -197,8 +429,8 @@ test("full snapshots restore memory, registers, and clock history", () => {
   simulator.addComponent("register", "REGISTER");
   simulator.addComponent("rom", "ROM");
   simulator.addComponent("ram", "RAM");
-  simulator.connect("data", "OUT", "register", "D");
-  simulator.connect("clock", "OUT", "register", "CLK");
+  addLine(simulator, "data", "OUT", "register", "D");
+  addLine(simulator, "clock", "OUT", "register", "CLK");
   simulator.loadROM("rom", [11, 22], 0);
   simulator.writeRAM("ram", 7, 99);
   simulator.setPort("data", "OUT", 42);
@@ -223,8 +455,8 @@ test("snapshot import rejects ambiguous state atomically", () => {
   source.addComponent("data", "LEVEL_INPUT", 8);
   source.addComponent("clock", "LEVEL_INPUT");
   source.addComponent("register", "REGISTER");
-  source.connect("data", "OUT", "register", "D");
-  source.connect("clock", "OUT", "register", "CLK");
+  addLine(source, "data", "OUT", "register", "D");
+  addLine(source, "clock", "OUT", "register", "CLK");
   const snapshot = source.exportSnapshot();
 
   const target = new TuringSimulator();
@@ -273,7 +505,7 @@ test("validation prechecks every vector before changing circuit state", async ()
   const simulator = new TuringSimulator();
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect("input", "OUT", "output", "IN");
+  addLine(simulator, "input", "OUT", "output", "IN");
   simulator.setPort("input", "OUT", 1);
 
   await assert.rejects(
@@ -293,9 +525,9 @@ test("validation supports reset-per-case and sequential-preserve modes", async (
     simulator.addComponent("clock", "LEVEL_INPUT");
     simulator.addComponent("register", "REGISTER");
     simulator.addComponent("output", "LEVEL_OUTPUT", 8);
-    simulator.connect("data", "OUT", "register", "D");
-    simulator.connect("clock", "OUT", "register", "CLK");
-    simulator.connect("register", "Q", "output", "IN");
+    addLine(simulator, "data", "OUT", "register", "D");
+    addLine(simulator, "clock", "OUT", "register", "CLK");
+    addLine(simulator, "register", "Q", "output", "IN");
     return simulator;
   };
   const inputs = [{ data: 5, clock: 1 }, { data: 7, clock: 1 }];
@@ -319,7 +551,7 @@ test("loaded validation can run one numbered case at a selected frequency", asyn
   const simulator = new TuringSimulator();
   simulator.addComponent("input", "LEVEL_INPUT");
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect("input", "OUT", "output", "IN");
+  addLine(simulator, "input", "OUT", "output", "IN");
   simulator.setValidationData(
     [{ input: 0 }, { input: 1 }],
     [{ output: 0 }, { output: 1 }],
@@ -347,7 +579,7 @@ test("settling rate is validated and paced without background ticks", async () =
   const simulator = new TuringSimulator();
   simulator.addComponent("source", "ALWAYS_ON");
   simulator.addComponent("output", "LEVEL_OUTPUT");
-  simulator.connect("source", "OUT", "output", "IN");
+  addLine(simulator, "source", "OUT", "output", "IN");
   const waits = [];
   simulator._waitForTicks = async (ticks, hz) => { waits.push({ ticks, hz }); };
 
@@ -379,8 +611,8 @@ test("scalable component widths can change and incompatible wires are removed", 
   simulator.addComponent("input", "LEVEL_INPUT", 4);
   simulator.addComponent("and", "AND", 4);
   simulator.addComponent("output", "LEVEL_OUTPUT", 4);
-  simulator.connect("input", "OUT", "and", "A");
-  simulator.connect("and", "OUT", "output", "IN");
+  addLine(simulator, "input", "OUT", "and", "A");
+  addLine(simulator, "and", "OUT", "output", "IN");
 
   const result = simulator.setComponentWidth("and", 8);
 
@@ -427,7 +659,7 @@ test("dependency menu can bind a component to another target", async (context) =
 
 test("extension errors are English by default", async () => {
   const extension = new Bsen975LogicGateExtension();
-  await extension.getPort({ id: "missing", port: "OUT" });
+  await extension.getPortProperty({ id: "missing", port: "OUT", property: "VALUE" });
   assert.equal(extension.getLastError(), "The circuit simulator is not running");
   extension.startCore();
   await extension.registerComponent({ dependency: "NONE", id: "bad", type: "UNKNOWN", width: 1 });
@@ -436,8 +668,15 @@ test("extension errors are English by default", async () => {
   assert.equal(extension.getLastError(), "Component width must be 1, 2, 4, or 8: 3");
   await extension.registerComponent({ dependency: "NONE", id: "one", type: "LEVEL_INPUT", width: 1 });
   await extension.registerComponent({ dependency: "NONE", id: "four", type: "AND", width: 4 });
-  await extension.operateConnection({ action: "CONNECT", id1: "one", port1: "OUT", id2: "four", port2: "A" });
+  await extension.createNamedLine({
+    lineId: "bad-width", id1: "one", port1: "OUT", id2: "four", port2: "A"
+  });
   assert.match(extension.getLastError(), /^Port width mismatch:/);
+  await extension.registerComponent({ dependency: "NONE", id: "otherSource", type: "LEVEL_INPUT", width: 1 });
+  await extension.createNamedLine({
+    lineId: "bad-direction", id1: "one", port1: "OUT", id2: "otherSource", port2: "OUT"
+  });
+  assert.match(extension.getLastError(), /^Incompatible port directions:/);
   await extension.registerComponent({ dependency: "NONE", id: "register", type: "REGISTER", width: 1 });
   await extension.setComponentWidth({ id: "register", width: 4 });
   assert.equal(extension.getLastError(), "Component type does not support width changes: REGISTER");
@@ -480,9 +719,11 @@ test("extension exposes paced settling and single-case validation blocks", async
   extension.startCore();
   await extension.registerComponent({ dependency: "NONE", id: "input", type: "LEVEL_INPUT", width: 1 });
   await extension.registerComponent({ dependency: "NONE", id: "output", type: "LEVEL_OUTPUT", width: 1 });
-  await extension.operateConnection({
-    action: "CONNECT", id1: "input", port1: "OUT", id2: "output", port2: "IN"
+  await extension.createNamedLine({
+    lineId: "test-wire", id1: "input", port1: "OUT", id2: "output", port2: "IN"
   });
+  assert.equal(JSON.parse(await extension.getLineInfo({ lineId: "test-wire" })).id, "test-wire");
+  assert.equal(JSON.parse(await extension.getLines()).length, 1);
   await extension.loadLevelData({
     inputs: '[{"input":0},{"input":1}]',
     expected: '[{"output":0},{"output":1}]',
@@ -521,7 +762,6 @@ test("every visible block has an extension implementation", () => {
   const extension = new Bsen975LogicGateExtension();
   const info = extension.getInfo();
   const blocks = info.blocks.filter((block) => block.opcode);
-  const visibleBlocks = blocks.filter((block) => !block.hideFromPalette);
   const buttons = info.blocks.filter((block) => block.func);
 
   assert.equal(info.name, "BSEN975 Circuit Simulator");
@@ -529,11 +769,12 @@ test("every visible block has an extension implementation", () => {
   for (const block of blocks) {
     assert.equal(typeof extension[block.opcode], "function", `missing opcode ${block.opcode}`);
   }
-  assert.ok(visibleBlocks.some((block) => block.opcode === "getPortProperty"));
-  assert.ok(visibleBlocks.some((block) => block.opcode === "getCircuitData"));
-  for (const legacyOpcode of ["getPort", "getPortWidth", "exportCircuit", "getGraph"]) {
-    const legacyBlock = blocks.find((block) => block.opcode === legacyOpcode);
-    assert.equal(legacyBlock.hideFromPalette, true, `${legacyOpcode} must stay registered but hidden`);
+  assert.ok(blocks.some((block) => block.opcode === "getPortProperty"));
+  assert.ok(blocks.some((block) => block.opcode === "getCircuitData"));
+  assert.ok(blocks.every((block) => !block.hideFromPalette));
+  for (const removedOpcode of ["operateConnection", "getPort", "getPortWidth", "exportCircuit", "getGraph"]) {
+    assert.equal(blocks.some((block) => block.opcode === removedOpcode), false);
+    assert.equal(typeof extension[removedOpcode], "undefined");
   }
   assert.ok(buttons.some((button) => button.text === "Open User Guide" && button.func === "openUserGuide"));
   for (const button of buttons) {
@@ -564,6 +805,8 @@ test("Simplified Chinese UI uses translations while component types stay canonic
   assert.ok(info.blocks.some((block) => block.text === "打开使用指南" && block.func === "openUserGuide"));
   assert.ok(info.blocks.some((block) => block.text === "=== 电路搭建 ==="));
   assert.ok(info.blocks.some((block) => block.text === "启动电路模拟器"));
+  assert.ok(info.blocks.some((block) => block.text.includes("连接线路 ID [lineId]")));
+  assert.ok(info.blocks.some((block) => block.text === "全部线路 JSON"));
   const dependencyMenu = extension.getDependencyMenu();
   assert.ok(dependencyMenu.some((item) => item.text === "舞台"));
   assert.ok(dependencyMenu.some((item) => item.text === "角色1"));
@@ -583,6 +826,12 @@ test("Simplified Chinese UI uses translations while component types stay canonic
   extension.startCore();
   await extension.registerComponent({ dependency: "NONE", id: "bad", type: "UNKNOWN", width: 1 });
   assert.equal(extension.getLastError(), "未知元件类型: UNKNOWN");
+  await extension.registerComponent({ dependency: "NONE", id: "left", type: "LEVEL_INPUT", width: 1 });
+  await extension.registerComponent({ dependency: "NONE", id: "right", type: "LEVEL_INPUT", width: 1 });
+  await extension.createNamedLine({
+    lineId: "方向错误", id1: "left", port1: "OUT", id2: "right", port2: "OUT"
+  });
+  assert.match(extension.getLastError(), /^端口方向不兼容:/);
   extension.stopCore();
 });
 

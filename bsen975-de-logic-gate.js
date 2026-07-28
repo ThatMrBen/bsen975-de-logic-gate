@@ -44,6 +44,7 @@
 
   const input = (width) => ({ direction: "input", width });
   const output = (width) => ({ direction: "output", width });
+  const passive = () => ({ direction: "passive", width: null });
 
   function gatePorts(count) {
     const ports = {};
@@ -82,12 +83,13 @@
     };
   }
 
-  // Port metadata is the single source of truth for width and direction checks.
+  // Fixed ports declare a width; passive VIA ports derive it from their current net.
   const COMPONENT_DEFINITIONS = Object.freeze({
     INPUT: { ports: { OUT: output(1) }, external: "OUT" },
     OUTPUT: { ports: { IN: input(1) }, observed: "IN" },
     LEVEL_INPUT: { ports: { OUT: output(1) }, external: "OUT" },
     LEVEL_OUTPUT: { ports: { IN: input(1) }, observed: "IN" },
+    VIA: { ports: { IO: passive() }, autoWidth: true },
     SWITCH: { ports: { A: input(1), S: input(1), OUT: output(1) }, combinational: true },
     ALWAYS_ON: { ports: { OUT: output(1) }, combinational: true },
     ALWAYS_OFF: { ports: { OUT: output(1) }, combinational: true },
@@ -189,37 +191,6 @@
     "4XOR": ["A", "B", "C", "D", "OUT"], "4XNOR": ["A", "B", "C", "D", "OUT"]
   });
 
-  const TYPE_ALIASES = Object.freeze({
-    HALFADDER: "HALF_ADDER",
-    FULLADDER: "FULL_ADDER",
-    ALWAYSON: "ALWAYS_ON",
-    ALWAYSOFF: "ALWAYS_OFF",
-    "4BIT_ADDER": "ADDER4",
-    "8BIT_ADDER": "ADDER8",
-    "4比特加法器": "ADDER4",
-    "8比特加法器": "ADDER8",
-    "1TO8分线器": "SPLITTER",
-    "8TO1集线器": "HUB",
-    "1TO2分线器": "SPLITTER2",
-    "2TO1集线器": "HUB2",
-    "1TO4分线器": "SPLITTER4",
-    "1TO4": "SPLITTER4",
-    "4TO1集线器": "HUB4",
-    "4TO1": "HUB4",
-    "2TO8": "CONVERTER_2_TO_8",
-    "2TO8转换器": "CONVERTER_2_TO_8",
-    "8TO2": "CONVERTER_8_TO_2",
-    "8TO2转换器": "CONVERTER_8_TO_2",
-    "4TO2": "CONVERTER_4_TO_2",
-    "4TO2转换器": "CONVERTER_4_TO_2",
-    "2TO4": "CONVERTER_2_TO_4",
-    "2TO4转换器": "CONVERTER_2_TO_4",
-    "4TO8": "CONVERTER_4_TO_8",
-    "4TO8转换器": "CONVERTER_4_TO_8",
-    "8TO4": "CONVERTER_8_TO_4",
-    "8TO4转换器": "CONVERTER_8_TO_4"
-  });
-
   function own(object, key) {
     return Object.prototype.hasOwnProperty.call(object, key);
   }
@@ -230,18 +201,20 @@
       this.nets = new Map();
       this.endpointToNet = new Map();
       this.connections = new Map();
+      this.connectionByEndpoints = new Map();
       this.validationInputs = new Set();
       this.validationOutputs = new Set();
       this.validationInputVectors = [];
       this.validationExpectedVectors = [];
       this.validationResetBeforeEachCase = false;
       this._nextNetId = 1;
+      this._nextLineId = 1;
     }
 
     addComponent(id, type, width = 1) {
       const normalizedId = this._normalizeId(id);
       const requestedType = String(type).trim().toUpperCase();
-      const normalizedType = TYPE_ALIASES[requestedType] || requestedType;
+      const normalizedType = requestedType;
       const baseDefinition = COMPONENT_DEFINITIONS[normalizedType];
       if (!baseDefinition) {
         throw new CircuitError(`未知元件类型: ${type}`, `Unknown component type: ${type}`);
@@ -285,46 +258,107 @@
       return component;
     }
 
-    connect(id1, port1, id2, port2) {
+    createLine(lineId, id1, port1, id2, port2) {
       const first = this._getEndpoint(id1, port1);
       const second = this._getEndpoint(id2, port2);
-      if (first.meta.width !== second.meta.width) {
+      if (first.key === second.key) {
         throw new CircuitError(
-          `端口位宽不匹配: ${first.key}(${first.meta.width}) 与 ${second.key}(${second.meta.width})`,
-          `Port width mismatch: ${first.key}(${first.meta.width}) and ${second.key}(${second.meta.width})`
+          `线路不能将端口连接到自身: ${first.key}`,
+          `A line cannot connect a port to itself: ${first.key}`
         );
       }
-      if (first.key === second.key) return this.endpointToNet.get(first.key) || null;
+
+      let normalizedLineId = this._normalizeLineId(lineId, true);
+      if (normalizedLineId && this.connections.has(normalizedLineId)) {
+        throw new CircuitError(
+          `线路 ID 已存在: ${normalizedLineId}`,
+          `Line ID already exists: ${normalizedLineId}`
+        );
+      }
 
       const key = this._connectionKey(first.key, second.key);
-      if (!this.connections.has(key)) {
-        const mergedEndpoints = new Set([first.key, second.key]);
-        for (const endpoint of [first, second]) {
-          const netId = this.endpointToNet.get(endpoint.key);
-          const net = netId && this.nets.get(netId);
-          if (net) for (const member of net.endpoints) mergedEndpoints.add(member);
-        }
-        const drivers = Array.from(mergedEndpoints, (endpointKey) => this._getEndpointByKey(endpointKey))
-          .filter((endpoint) => endpoint.meta.direction === "output");
-        if (drivers.length > 1) {
-          const driverList = drivers.map((item) => item.key).join(", ");
-          throw new CircuitError(
-            `连接会产生多个驱动端: ${driverList}`,
-            `Connection would create multiple drivers: ${driverList}`
-          );
-        }
-        this.connections.set(key, { first: first.key, second: second.key });
-        this._rebuildNets();
+      if (this.connectionByEndpoints.has(key)) {
+        throw new CircuitError(
+          `两个端口之间已存在线路: ${first.key} 与 ${second.key}`,
+          `A line already exists between ports: ${first.key} and ${second.key}`
+        );
       }
-      return this.endpointToNet.get(first.key);
+
+      const hasPassivePort = first.meta.direction === "passive" || second.meta.direction === "passive";
+      if (!hasPassivePort && first.meta.direction === second.meta.direction) {
+        throw new CircuitError(
+          `端口方向不兼容: ${first.key}(${first.meta.direction}) 与 ${second.key}(${second.meta.direction})`,
+          `Incompatible port directions: ${first.key}(${first.meta.direction}) and ${second.key}(${second.meta.direction})`
+        );
+      }
+
+      const mergedEndpoints = new Set([first.key, second.key]);
+      for (const endpoint of [first, second]) {
+        const netId = this.endpointToNet.get(endpoint.key);
+        const net = netId && this.nets.get(netId);
+        if (net) for (const member of net.endpoints) mergedEndpoints.add(member);
+      }
+      const widthExamples = new Map();
+      for (const endpointKey of mergedEndpoints) {
+        const endpoint = this._getEndpointByKey(endpointKey);
+        if (endpoint.meta.width == null || widthExamples.has(endpoint.meta.width)) continue;
+        widthExamples.set(endpoint.meta.width, endpoint.key);
+      }
+      if (widthExamples.size > 1) {
+        const [[firstWidth, firstKey], [secondWidth, secondKey]] = Array.from(widthExamples.entries());
+        throw new CircuitError(
+          `端口位宽不匹配: ${firstKey}(${firstWidth}) 与 ${secondKey}(${secondWidth})`,
+          `Port width mismatch: ${firstKey}(${firstWidth}) and ${secondKey}(${secondWidth})`
+        );
+      }
+      const drivers = Array.from(mergedEndpoints, (endpointKey) => this._getEndpointByKey(endpointKey))
+        .filter((endpoint) => endpoint.meta.direction === "output");
+      if (drivers.length > 1) {
+        const driverList = drivers.map((item) => item.key).join(", ");
+        throw new CircuitError(
+          `连接会产生多个驱动端: ${driverList}`,
+          `Connection would create multiple drivers: ${driverList}`
+        );
+      }
+
+      if (!normalizedLineId) normalizedLineId = this._generateLineId();
+      this.connections.set(normalizedLineId, {
+        id: normalizedLineId,
+        first: first.key,
+        second: second.key
+      });
+      this.connectionByEndpoints.set(key, normalizedLineId);
+      this._rebuildNets();
+      return normalizedLineId;
     }
 
-    disconnect(id1, port1, id2, port2) {
-      const first = this._getEndpoint(id1, port1);
-      const second = this._getEndpoint(id2, port2);
-      const removed = this.connections.delete(this._connectionKey(first.key, second.key));
-      if (removed) this._rebuildNets();
-      return removed;
+    removeLine(lineId) {
+      const normalizedLineId = this._normalizeLineId(lineId);
+      if (!this.connections.has(normalizedLineId)) {
+        throw new CircuitError(
+          `线路不存在: ${normalizedLineId}`,
+          `Line does not exist: ${normalizedLineId}`
+        );
+      }
+      this._deleteLine(normalizedLineId);
+      this._rebuildNets();
+      return true;
+    }
+
+    getLineInfo(lineId) {
+      const normalizedLineId = this._normalizeLineId(lineId);
+      const connection = this.connections.get(normalizedLineId);
+      if (!connection) {
+        throw new CircuitError(
+          `线路不存在: ${normalizedLineId}`,
+          `Line does not exist: ${normalizedLineId}`
+        );
+      }
+      return this._lineInfo(connection);
+    }
+
+    getLines() {
+      return Array.from(this.connections.values(), (connection) => this._lineInfo(connection));
     }
 
     clear() {
@@ -332,12 +366,14 @@
       this.nets.clear();
       this.endpointToNet.clear();
       this.connections.clear();
+      this.connectionByEndpoints.clear();
       this.validationInputs.clear();
       this.validationOutputs.clear();
       this.validationInputVectors = [];
       this.validationExpectedVectors = [];
       this.validationResetBeforeEachCase = false;
       this._nextNetId = 1;
+      this._nextLineId = 1;
       return this;
     }
 
@@ -355,9 +391,9 @@
     removeComponent(id) {
       const component = this._getComponent(id);
       const prefix = `${component.id}.`;
-      for (const [key, connection] of this.connections) {
+      for (const [lineId, connection] of this.connections) {
         if (connection.first.startsWith(prefix) || connection.second.startsWith(prefix)) {
-          this.connections.delete(key);
+          this._deleteLine(lineId);
         }
       }
       this.components.delete(component.id);
@@ -376,14 +412,14 @@
       return Object.entries(component.definition.ports).map(([name, meta]) => ({
         name,
         direction: meta.direction,
-        width: meta.width,
+        width: this._getEndpointWidth(this._getEndpoint(component.id, name)),
         value: component.pins.get(name),
         connected: this.endpointToNet.has(`${component.id}.${name}`)
       }));
     }
 
     getPortWidth(id, port) {
-      return this._getEndpoint(id, port).meta.width;
+      return this._getEndpointWidth(this._getEndpoint(id, port));
     }
 
     setComponentWidth(id, width) {
@@ -405,17 +441,26 @@
       if (component.bitWidth === bitWidth) return { width: bitWidth, disconnected: [] };
 
       const scalableSet = new Set(scalablePorts);
-      const proposedWidth = (endpoint) => (
-        endpoint.component === component && scalableSet.has(endpoint.port) ? bitWidth : endpoint.meta.width
-      );
       const disconnected = [];
-      for (const [key, connection] of this.connections) {
+      for (const [lineId, connection] of this.connections) {
         const first = this._getEndpointByKey(connection.first);
         const second = this._getEndpointByKey(connection.second);
-        if (first.component !== component && second.component !== component) continue;
-        if (proposedWidth(first) === proposedWidth(second)) continue;
-        disconnected.push({ from: connection.first, to: connection.second });
-        this.connections.delete(key);
+        const changedEndpoint = first.component === component && scalableSet.has(first.port)
+          ? first
+          : second.component === component && scalableSet.has(second.port) ? second : null;
+        if (!changedEndpoint) continue;
+        const otherKey = changedEndpoint === first ? second.key : first.key;
+        const otherWidths = new Set();
+        for (const endpointKey of this._connectedEndpointKeys(otherKey, lineId)) {
+          const endpoint = this._getEndpointByKey(endpointKey);
+          const endpointWidth = endpoint.component === component && scalableSet.has(endpoint.port)
+            ? bitWidth
+            : endpoint.meta.width;
+          if (endpointWidth != null) otherWidths.add(endpointWidth);
+        }
+        if (otherWidths.size === 0 || (otherWidths.size === 1 && otherWidths.has(bitWidth))) continue;
+        disconnected.push({ id: connection.id, from: connection.first, to: connection.second });
+        this._deleteLine(lineId);
       }
 
       const ports = {};
@@ -522,14 +567,17 @@
       const links = [];
       for (const connection of this.connections.values()) {
         if (connection.first.startsWith(`${component.id}.`) || connection.second.startsWith(`${component.id}.`)) {
-          links.push({ from: connection.first, to: connection.second });
+          links.push({ id: connection.id, from: connection.first, to: connection.second });
         }
       }
       return {
         id: component.id,
         type: component.type,
-        bitWidth: component.bitWidth,
-        ports: component.definition.ports,
+        bitWidth: component.definition.autoWidth ? this.getPortWidth(component.id, "IO") : component.bitWidth,
+        ports: Object.fromEntries(Object.entries(component.definition.ports).map(([name, meta]) => [
+          name,
+          { ...meta, width: this.getPortWidth(component.id, name) }
+        ])),
         pins: Object.fromEntries(component.pins),
         links
       };
@@ -540,11 +588,14 @@
         components: Array.from(this.components.values(), (component) => ({
           id: component.id,
           type: component.type,
-          bitWidth: component.bitWidth,
-          ports: component.definition.ports,
+          bitWidth: component.definition.autoWidth ? this.getPortWidth(component.id, "IO") : component.bitWidth,
+          ports: Object.fromEntries(Object.entries(component.definition.ports).map(([name, meta]) => [
+            name,
+            { ...meta, width: this.getPortWidth(component.id, name) }
+          ])),
           pins: Object.fromEntries(component.pins)
         })),
-        connections: Array.from(this.connections.values(), ({ first, second }) => ({ from: first, to: second })),
+        connections: Array.from(this.connections.values(), ({ id, first, second }) => ({ id, from: first, to: second })),
         nets: Array.from(this.nets.values(), (net) => ({
           id: net.id,
           width: net.width,
@@ -674,9 +725,10 @@
         components: Array.from(this.components.values(), (component) => ({
           id: component.id,
           type: component.type,
-          width: component.bitWidth == null ? 1 : component.bitWidth
+          width: component.definition.autoWidth ? 0 : component.bitWidth == null ? 1 : component.bitWidth
         })),
-        connections: Array.from(this.connections.values(), ({ first, second }) => ({
+        connections: Array.from(this.connections.values(), ({ id, first, second }) => ({
+          id,
           from: first,
           to: second
         }))
@@ -738,9 +790,16 @@
         if (!connection || typeof connection !== "object" || Array.isArray(connection)) {
           throw new CircuitError("连线定义必须是对象", "A connection definition must be an object");
         }
+        const lineId = replacement._normalizeLineId(connection.id);
         const first = this._splitEndpointKey(connection.from, "连线起点");
         const second = this._splitEndpointKey(connection.to, "连线终点");
-        replacement.connect(first.id, first.port, second.id, second.port);
+        replacement.createLine(
+          lineId,
+          first.id,
+          first.port,
+          second.id,
+          second.port
+        );
       }
 
       this._adoptSimulator(replacement);
@@ -789,7 +848,7 @@
             `Snapshot is missing component state: ${component.id}`
           );
         }
-        for (const [port, meta] of Object.entries(component.definition.ports)) {
+        for (const port of Object.keys(component.definition.ports)) {
           if (!own(state.pins, port)) {
             throw new CircuitError(
               `快照缺少端口状态: ${component.id}.${port}`,
@@ -798,7 +857,11 @@
           }
           component.pins.set(
             port,
-            replacement._normalizeSignal(state.pins[port], meta.width, `${component.id}.${port}`)
+            replacement._normalizeSignal(
+              state.pins[port],
+              replacement.getPortWidth(component.id, port),
+              `${component.id}.${port}`
+            )
           );
         }
         if (component.definition.sequential) {
@@ -837,12 +900,14 @@
       this.nets = replacement.nets;
       this.endpointToNet = replacement.endpointToNet;
       this.connections = replacement.connections;
+      this.connectionByEndpoints = replacement.connectionByEndpoints;
       this.validationInputs = replacement.validationInputs;
       this.validationOutputs = replacement.validationOutputs;
       this.validationInputVectors = [];
       this.validationExpectedVectors = [];
       this.validationResetBeforeEachCase = false;
       this._nextNetId = replacement._nextNetId;
+      this._nextLineId = replacement._nextLineId;
     }
 
     setValidationData(inputList, expectedList, options = {}) {
@@ -1040,7 +1105,10 @@
       net.value = value;
       for (const endpointKey of net.endpoints) {
         const endpoint = this._getEndpointByKey(endpointKey);
-        if (endpoint.meta.direction !== "input" || endpoint.component.pins.get(endpoint.port) === value) continue;
+        if (
+          !["input", "passive"].includes(endpoint.meta.direction) ||
+          endpoint.component.pins.get(endpoint.port) === value
+        ) continue;
         endpoint.component.pins.set(endpoint.port, value);
         enqueue(endpoint.component);
       }
@@ -1244,6 +1312,41 @@
       return normalized;
     }
 
+    _normalizeLineId(lineId, allowEmpty = false) {
+      const normalized = lineId == null ? "" : String(lineId).trim();
+      if (!normalized && !allowEmpty) {
+        throw new CircuitError("线路 ID 不能为空", "Line ID cannot be empty");
+      }
+      return normalized;
+    }
+
+    _generateLineId() {
+      let lineId;
+      do { lineId = `line-${this._nextLineId++}`; } while (this.connections.has(lineId));
+      return lineId;
+    }
+
+    _deleteLine(lineId) {
+      const connection = this.connections.get(lineId);
+      if (!connection) return false;
+      this.connections.delete(lineId);
+      this.connectionByEndpoints.delete(this._connectionKey(connection.first, connection.second));
+      return true;
+    }
+
+    _lineInfo(connection) {
+      const netId = this.endpointToNet.get(connection.first) || null;
+      const net = netId && this.nets.get(netId);
+      return {
+        id: connection.id,
+        from: connection.first,
+        to: connection.second,
+        width: net ? net.width : 0,
+        value: net ? net.value : 0,
+        netId
+      };
+    }
+
     _getComponent(id) {
       const normalized = this._normalizeId(id);
       const component = this.components.get(normalized);
@@ -1269,6 +1372,36 @@
     _getEndpointByKey(key) {
       const endpoint = this._splitEndpointKey(key, "端口");
       return this._getEndpoint(endpoint.id, endpoint.port);
+    }
+
+    _getEndpointWidth(endpoint) {
+      if (endpoint.meta.width != null) return endpoint.meta.width;
+      const netId = this.endpointToNet.get(endpoint.key);
+      const net = netId && this.nets.get(netId);
+      return net ? net.width : 0;
+    }
+
+    _connectedEndpointKeys(startKey, excludedLineId = null) {
+      const adjacency = new Map();
+      const addNeighbor = (from, to) => {
+        if (!adjacency.has(from)) adjacency.set(from, []);
+        adjacency.get(from).push(to);
+      };
+      for (const [lineId, connection] of this.connections) {
+        if (lineId === excludedLineId) continue;
+        addNeighbor(connection.first, connection.second);
+        addNeighbor(connection.second, connection.first);
+      }
+      const visited = new Set([startKey]);
+      const queue = [startKey];
+      for (let index = 0; index < queue.length; index++) {
+        for (const neighbor of adjacency.get(queue[index]) || []) {
+          if (visited.has(neighbor)) continue;
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+      return visited;
     }
 
     _splitEndpointKey(key, label) {
@@ -1312,16 +1445,42 @@
       }
       for (const endpoints of groups.values()) {
         const id = `net-${this._nextNetId++}`;
-        const width = this._getEndpointByKey(endpoints[0]).meta.width;
+        const widths = new Set();
+        for (const endpointKey of endpoints) {
+          const width = this._getEndpointByKey(endpointKey).meta.width;
+          if (width != null) widths.add(width);
+        }
+        if (widths.size > 1) {
+          throw new CircuitError(
+            `网络包含不兼容位宽: ${Array.from(widths).join(", ")}`,
+            `Net contains incompatible widths: ${Array.from(widths).join(", ")}`
+          );
+        }
+        const width = widths.size === 1 ? Array.from(widths)[0] : 0;
         const net = { id, width, endpoints: new Set(endpoints), value: 0 };
         this.nets.set(id, net);
         for (const endpoint of endpoints) this.endpointToNet.set(endpoint, id);
+
+        const hasDriver = endpoints.some((endpointKey) => (
+          this._getEndpointByKey(endpointKey).meta.direction === "output"
+        ));
+        if (!hasDriver) {
+          for (const endpointKey of endpoints) {
+            const endpoint = this._getEndpointByKey(endpointKey);
+            if (["input", "passive"].includes(endpoint.meta.direction)) {
+              endpoint.component.pins.set(endpoint.port, 0);
+            }
+          }
+        }
       }
 
-      // Inputs disconnected from every net immediately return to their documented default value.
+      // Non-driving ports disconnected from every net immediately return to zero.
       for (const component of this.components.values()) {
         for (const [port, meta] of Object.entries(component.definition.ports)) {
-          if (meta.direction !== "input" || this.endpointToNet.has(`${component.id}.${port}`)) continue;
+          if (
+            !["input", "passive"].includes(meta.direction) ||
+            this.endpointToNet.has(`${component.id}.${port}`)
+          ) continue;
           component.pins.set(port, 0);
         }
       }
@@ -1346,21 +1505,22 @@
     "help.quickStart": "快速开始",
     "help.step1": "启动电路模拟器，然后清空当前电路。",
     "help.step2": "添加测试输入、逻辑门和测试输出，并为每个元件设置唯一 ID。",
-    "help.step3": "按“元件ID.端口”连接端口，例如 input.OUT → gate.A。",
+    "help.step3": "为每条线路填写唯一线路 ID，再按“元件ID.端口”连接，例如 wire-1：input.OUT → gate.A。",
     "help.step4": "设置输入值，再按所需 Hz 执行“传播电路直到稳定”；0 Hz 表示不限速。",
     "help.step5": "寄存器或 RAM 使用时钟时，执行“让时钟输入产生脉冲”。",
     "help.step6": "载入测试用例后，可按编号运行单组，也可按指定 Hz 运行全部测试，再从测试结果 JSON 读取结果。",
     "help.rules": "接线规则",
     "help.rule1": "元件 ID 区分大小写，端口名称不区分大小写。",
-    "help.rule2": "只能连接相同位宽的端口；一个网络只能有一个输出驱动端。",
+    "help.rule2": "输出可连接输入，VIA.IO 可连接任意方向；输入不能直连输入，输出不能直连输出。端口位宽必须一致，一个网络只能有一个输出驱动端。",
     "help.rule3": "未连接的输入默认为 0。组合逻辑传播不会触发寄存器或 RAM；“模拟电路 N 步”始终只推进 N 步。",
     "help.rule4": "测试输入和测试输出会自动成为验证接口；普通外部输入和输出不会。",
+    "help.viaRule": "VIA 是只有 IO 一个无源端口的过孔。所有交汇分支连接同一个 VIA.IO；没有 VIA 的几何交叉不会合并网络。",
     "help.memoryWiring": "正常运行时，ROM 和 RAM 必须通过 ADDR、DATA、DIN、DOUT、WE、CLK 引脚与其他元件连接。直接装载、读写和清空存储器的积木只用于关卡初始化、存档和调试。",
     "help.testing": "测试数据示例",
     "help.testingNote": "下面的数据验证 input → NOT → output：",
-    "help.more": "完整元件端口可在“元件的端口列表 JSON”中查询，运行状态可从“当前电路的运行状态 JSON”检查。",
+    "help.more": "完整元件端口可在“元件的端口列表 JSON”中查询；每条线路可从“线路信息 JSON”检查，全部信号可从运行状态 JSON 检查。",
     "help.widthTitle": "比特位宽",
-    "help.widthNote": "添加可变宽度元件时，位宽可以设置为 1、2、4 或 8。数据引脚会采用所选位宽，SEL、CLK、WE 等控制引脚仍为 1 位。固定结构元件使用下表中的固定位宽。",
+    "help.widthNote": "添加可变宽度元件时，位宽可以设置为 1、2、4 或 8。数据引脚会采用所选位宽，SEL、CLK、WE 等控制引脚仍为 1 位。VIA 忽略添加积木中的位宽，IO 会根据相连线路自动推导；未连接时为 0。",
     "help.widthChange": "已添加的可变宽度元件可以使用“将元件的位宽改为”再次修改。修改后，与新位宽不兼容的连线会自动断开。",
     "help.pinTable": "元件引脚对应表",
     "help.pinNote": "W 表示添加元件时选择的位宽。可将“端口的属性”切换为“位宽”，查询任意已添加元件的具体引脚。",
@@ -1382,6 +1542,7 @@
     "help.busWidth2": "总线：2",
     "help.busWidth4": "总线：4",
     "help.busWidth8": "总线：8",
+    "help.viaWidth": "IO：自动 0 / 1 / 2 / 4 / 8",
     "block.start": "启动电路模拟器",
     "block.stop": "关闭电路模拟器",
     "block.running": "电路模拟器已启动？",
@@ -1391,17 +1552,17 @@
     "block.add": "添加 [type] 元件 ID [id] 位宽 [width] 绑定 [dependency]",
     "block.remove": "删除元件 ID [id]",
     "block.exists": "存在元件 ID [id]？",
-    "block.connection": "[action] 端口 [id1].[port1] 和 [id2].[port2]",
+    "block.createLine": "连接线路 ID [lineId]：[id1].[port1] 到 [id2].[port2]",
+    "block.removeLine": "删除线路 ID [lineId]",
+    "block.lineInfo": "线路 [lineId] 信息 JSON",
+    "block.lines": "全部线路 JSON",
     "block.componentIds": "所有元件 ID JSON",
     "block.ports": "元件 [id] 的端口列表 JSON",
-    "block.portWidth": "端口 [id].[port] 的位宽",
     "block.portProperty": "端口 [id].[port] 的 [property]",
     "block.setWidth": "将元件 [id] 的位宽改为 [width]",
-    "block.export": "导出电路结构 JSON",
     "block.import": "导入电路结构或快照 JSON [json]",
     "block.setInput": "将输入 [id] 设为 [value]",
     "block.setInputs": "批量设置输入 JSON [json]",
-    "block.getPort": "端口 [id].[port] 的值",
     "block.readPorts": "批量读取端口 JSON [json]",
     "block.settle": "以 [hz] Hz 传播电路直到稳定",
     "block.pulse": "让时钟输入 [id] 产生 [count] 次脉冲",
@@ -1417,7 +1578,6 @@
     "block.dumpMemory": "存储器 [id] 内容 JSON",
     "block.isBound": "[target] 已绑定电路元件？",
     "block.boundInfo": "[target] 绑定元件的 [property]",
-    "block.graph": "当前电路状态 JSON",
     "block.circuitData": "当前电路的 [kind] JSON",
     "menu.noBinding": "不绑定",
     "menu.currentTarget": "当前角色",
@@ -1426,8 +1586,6 @@
     "menu.unnamedTarget": "未命名角色",
     "menu.self": "自己",
     "menu.cloneSuffix": "（克隆体）",
-    "menu.connect": "连接",
-    "menu.disconnect": "断开",
     "menu.componentId": "元件 ID",
     "menu.type": "类型",
     "menu.width": "位宽",
@@ -1468,7 +1626,6 @@
       ${CircuitError.toString()}
       const COMPONENT_DEFINITIONS = Object.freeze(${JSON.stringify(COMPONENT_DEFINITIONS)});
       const SCALABLE_PORTS = Object.freeze(${JSON.stringify(SCALABLE_PORTS)});
-      const TYPE_ALIASES = Object.freeze(${JSON.stringify(TYPE_ALIASES)});
       ${own.toString()}
       ${englishErrorLabel.toString()}
       ${TuringSimulator.toString()}
@@ -1651,16 +1808,27 @@
             arguments: { id: { type: string, defaultValue: "gate1" } }
           },
           {
-            opcode: "operateConnection", blockType: command,
-            text: t("block.connection", "[action] ports [id1].[port1] and [id2].[port2]"),
+            opcode: "createNamedLine", blockType: command,
+            text: t("block.createLine", "connect line ID [lineId]: [id1].[port1] to [id2].[port2]"),
             arguments: {
-              action: { type: string, menu: "connectionActions", defaultValue: "CONNECT" },
+              lineId: { type: string, defaultValue: "line-1" },
               id1: { type: string, defaultValue: "input1" },
               port1: { type: string, defaultValue: "OUT" },
               id2: { type: string, defaultValue: "gate1" },
               port2: { type: string, defaultValue: "A" }
             }
           },
+          {
+            opcode: "removeNamedLine", blockType: command,
+            text: t("block.removeLine", "remove line ID [lineId]"),
+            arguments: { lineId: { type: string, defaultValue: "line-1" } }
+          },
+          {
+            opcode: "getLineInfo", blockType: reporter,
+            text: t("block.lineInfo", "line [lineId] info JSON"),
+            arguments: { lineId: { type: string, defaultValue: "line-1" } }
+          },
+          { opcode: "getLines", blockType: reporter, text: t("block.lines", "all lines JSON") },
           { opcode: "getComponentIds", blockType: reporter, text: t("block.componentIds", "all component IDs JSON") },
           {
             opcode: "getPortDefinitions", blockType: reporter, text: t("block.ports", "ports of component [id] JSON"),
@@ -1786,44 +1954,11 @@
               target: { type: string, menu: "targets", defaultValue: "SELF" },
               property: { type: string, menu: "componentProperties", defaultValue: "ID" }
             }
-          },
-
-          // Keep legacy opcodes registered so existing projects continue to run.
-          {
-            opcode: "getPort", blockType: reporter, hideFromPalette: true,
-            text: t("block.getPort", "value of port [id].[port]"),
-            arguments: {
-              id: { type: string, defaultValue: "gate1" },
-              port: { type: string, defaultValue: "OUT" }
-            }
-          },
-          {
-            opcode: "getPortWidth", blockType: reporter, hideFromPalette: true,
-            text: t("block.portWidth", "bit width of port [id].[port]"),
-            arguments: {
-              id: { type: string, defaultValue: "gate1" },
-              port: { type: string, defaultValue: "OUT" }
-            }
-          },
-          {
-            opcode: "exportCircuit", blockType: reporter, hideFromPalette: true,
-            text: t("block.export", "export circuit structure JSON")
-          },
-          {
-            opcode: "getGraph", blockType: reporter, hideFromPalette: true,
-            text: t("block.graph", "current circuit state JSON")
           }
         ],
         menus: {
           componentTypes: { acceptReporters: true, items: typeMenu() },
           dependencies: { acceptReporters: true, items: "getDependencyMenu" },
-          connectionActions: {
-            acceptReporters: false,
-            items: [
-              { text: t("menu.connect", "connect"), value: "CONNECT" },
-              { text: t("menu.disconnect", "disconnect"), value: "DISCONNECT" }
-            ]
-          },
           componentProperties: {
             acceptReporters: false,
             items: [
@@ -1986,7 +2121,7 @@
       addList([
         t("help.step1", "Start the circuit simulator, then clear the current circuit."),
         t("help.step2", "Add Test Input, gates, and Test Output components. Give every component a unique ID."),
-        t("help.step3", "Connect ports as componentID.port, for example input.OUT → gate.A."),
+        t("help.step3", "Give each line a unique line ID, then connect componentID.port endpoints, for example wire-1: input.OUT → gate.A."),
         t("help.step4", "Set input values, then settle at the requested Hz. Use 0 Hz for unlimited speed."),
         t("help.step5", "For registers or RAM, pulse the connected clock input."),
         t("help.step6", "Load test cases, then run one numbered case or all cases at the requested Hz and read the result JSON.")
@@ -1994,10 +2129,14 @@
       addHeading(t("help.rules", "Wiring Rules"));
       addList([
         t("help.rule1", "Component IDs are case-sensitive. Port names are case-insensitive."),
-        t("help.rule2", "Only ports with equal widths can connect. Each net can have only one output driver."),
+        t("help.rule2", "Outputs connect to inputs, while VIA.IO can connect to any direction. Inputs cannot connect directly to inputs, and outputs cannot connect directly to outputs. Widths must match and each net can have only one output driver."),
         t("help.rule3", "Unconnected inputs default to 0. Settling does not trigger registers or RAM, and simulate N steps always advances exactly N steps."),
         t("help.rule4", "Test Input and Test Output automatically become validation interfaces; regular external I/O does not.")
       ]);
+      addParagraph(t(
+        "help.viaRule",
+        "VIA is a junction with one passive IO port. Connect every intersecting branch to the same VIA.IO; geometric crossings without a VIA remain separate nets."
+      ));
       addParagraph(t(
         "help.memoryWiring",
         "During normal execution, ROM and RAM connect to other components through ADDR, DATA, DIN, DOUT, WE, and CLK pins. Direct memory load, read, write, and clear blocks are only for level setup, saves, and debugging."
@@ -2005,7 +2144,7 @@
       addHeading(t("help.widthTitle", "Bit Width"));
       addParagraph(t(
         "help.widthNote",
-        "For scalable components, choose a width of 1, 2, 4, or 8 when adding the component. Data pins use that width, while control pins such as SEL, CLK, and WE remain 1 bit. Fixed-layout components use the widths below."
+        "For scalable components, choose a width of 1, 2, 4, or 8 when adding the component. Data pins use that width, while control pins such as SEL, CLK, and WE remain 1 bit. VIA ignores the add-block width and infers IO from connected wires; it reports 0 while disconnected."
       ));
       addParagraph(t(
         "help.widthChange",
@@ -2026,6 +2165,7 @@
       ], [
         ["LEVEL_INPUT / INPUT", none, "OUT", `OUT: W; ${variableWidth}`],
         ["LEVEL_OUTPUT / OUTPUT", "IN", none, `IN: W; ${variableWidth}`],
+        ["VIA", "IO (passive)", none, t("help.viaWidth", "IO: auto 0 / 1 / 2 / 4 / 8")],
         ["SWITCH", "A, S", "OUT", `A/OUT: W; S: 1; ${variableWidth}`],
         ["ALWAYS_ON / ALWAYS_OFF", none, "OUT", `OUT: W; ${variableWidth}`],
         ["NOT", "A", "OUT", `A/OUT: W; ${variableWidth}`],
@@ -2073,13 +2213,16 @@
         [t("block.lastError", "last error"), local("读取最近失败原因。", "Read the most recent failure."), local("返回本地化错误文字；下一次成功操作会清空它。", "Returns a localized message; the next successful operation clears it.")],
         [t("block.clear", "clear current circuit"), local("删除当前电路。", "Delete the current circuit."), local("移除全部元件、连线、测试数据和绑定。", "Removes all components, wires, test data, and bindings.")],
         [t("block.reset", "reset circuit state"), local("重新初始化运行状态。", "Reinitialize runtime state."), local("保留元件和连线；清零引脚、寄存器和 RAM，保留 ROM。", "Keeps components and wires; clears pins, registers, and RAM while preserving ROM.")],
-        [t("block.add", "add [type] component ID [id] width [width] bind to [dependency]"), local("创建一个元件实例。", "Create a component instance."), local("加入指定 ID、类型和位宽的元件；LEVEL 接口自动加入测试，选定目标会建立绑定。", "Adds the selected ID, type, and width; LEVEL interfaces join validation and a selected target is bound.")],
+        [t("block.add", "add [type] component ID [id] width [width] bind to [dependency]"), local("创建一个元件实例。", "Create a component instance."), local("加入指定 ID 和类型；普通可变宽度元件使用所选位宽，VIA 忽略该参数并自动适应线路。LEVEL 接口自动加入测试。", "Adds the selected ID and type; regular scalable components use the selected width, while VIA ignores it and adapts to its net. LEVEL interfaces join validation.")],
         [t("block.remove", "remove component ID [id]"), local("删除一个元件。", "Delete one component."), local("同时移除其连线、测试接口登记和角色绑定。", "Also removes its wires, validation-interface entry, and target binding.")],
         [t("block.exists", "component ID [id] exists?"), local("检查 ID 是否已使用。", "Check whether an ID is in use."), local("返回布尔值，不修改电路。", "Returns a Boolean without changing the circuit.")],
-        [t("block.connection", "[action] ports [id1].[port1] and [id2].[port2]"), local("连接或断开两个端口。", "Connect or disconnect two ports."), local("连接会合并网络；断开只删除指定边。位宽不一致或多驱动时失败。", "Connect merges nets; disconnect removes only that edge. Width mismatch or multiple drivers fails.")],
+        [t("block.createLine", "connect line ID [lineId]: [id1].[port1] to [id2].[port2]"), local("创建一条可供前端绘制的命名线路。", "Create a named line that the frontend can draw."), local("保存稳定线路 ID 和两个端点；空 ID 自动生成。方向、位宽、重复端点或多驱动不合法时原子失败。", "Stores a stable line ID and endpoints; an empty ID is generated. Invalid direction, width, duplicate endpoints, or multiple drivers fails atomically.")],
+        [t("block.removeLine", "remove line ID [lineId]"), local("精确删除一条线路。", "Remove one exact line."), local("重建剩余网络并重新推导 VIA 位宽；其他分支不受影响。", "Rebuilds remaining nets and re-infers VIA widths without removing other branches.")],
+        [t("block.lineInfo", "line [lineId] info JSON"), local("查询一条线路。", "Inspect one line."), local("返回 ID、起点、终点、网络 ID、位宽和当前值。", "Returns ID, endpoints, net ID, width, and current value.")],
+        [t("block.lines", "all lines JSON"), local("批量查询全部线路。", "Inspect every line at once."), local("按创建顺序返回线路信息数组，供前端检查和绘制。", "Returns line information in creation order for frontend inspection and drawing.")],
         [t("block.componentIds", "all component IDs JSON"), local("枚举电路元件。", "Enumerate circuit components."), local("返回按添加顺序排列的 ID 数组 JSON。", "Returns a JSON array of IDs in insertion order.")],
         [t("block.ports", "ports of component [id] JSON"), local("检查元件全部引脚。", "Inspect every pin on a component."), local("返回名称、方向、位宽、当前值和连接状态。", "Returns name, direction, width, current value, and connection state.")],
-        [t("block.setWidth", "set component [id] width to [width]"), local("修改可变宽度元件。", "Resize a scalable component."), local("更新数据引脚到 1/2/4/8 位，固定控制脚不变，并断开不兼容连线。", "Changes data pins to 1/2/4/8 bits, preserves fixed control pins, and disconnects incompatible wires.")],
+        [t("block.setWidth", "set component [id] width to [width]"), local("修改可变宽度元件。", "Resize a scalable component."), local("更新普通数据引脚到 1/2/4/8 位并断开不兼容连线；VIA 不支持手动修改。", "Changes regular data pins to 1/2/4/8 bits and disconnects incompatible wires; VIA cannot be resized manually.")],
         [t("block.circuitData", "current circuit [kind] JSON"), local("导出结构、调试状态或完整快照。", "Export structure, debug state, or a full snapshot."), local("结构用于模板；运行状态用于观察信号；快照还保存 RAM、ROM、寄存器和时钟历史。", "Structure is for templates, runtime state observes signals, and snapshots also preserve RAM, ROM, registers, and clock history.")],
         [t("block.import", "import circuit structure or snapshot JSON [json]"), local("载入已保存的结构或快照。", "Load a saved structure or snapshot."), local("完整校验后原子替换电路，并清除旧绑定和测试数据；失败时保留原电路。", "Atomically replaces the circuit after full validation and clears bindings/tests; failure preserves the old circuit.")],
         [t("block.setInput", "set input [id] to [value]"), local("设置单个外部输入。", "Set one external input."), local("只修改输入源 OUT；需要随后传播或产生时钟。", "Changes only the source OUT pin; settle or pulse afterward.")],
@@ -2112,7 +2255,7 @@
       body.appendChild(code);
       addParagraph(t(
         "help.more",
-        "Use the component ports JSON block for complete port metadata and current circuit state JSON for runtime diagnostics."
+        "Use component ports JSON for complete pin metadata, line info JSON for one physical line, and runtime state JSON for all signal diagnostics."
       ));
       dialog.appendChild(body);
 
@@ -2248,10 +2391,6 @@
       return this._reporter(async () => JSON.stringify(await this.core.call("getPortDefinitions", args.id)));
     }
 
-    async getPortWidth(args) {
-      return this._reporter(() => this.core.call("getPortWidth", args.id, args.port));
-    }
-
     async getPortProperty(args) {
       const method = String(args.property).toUpperCase() === "WIDTH" ? "getPortWidth" : "getPort";
       return this._reporter(() => this.core.call(method, args.id, args.port));
@@ -2259,10 +2398,6 @@
 
     async setComponentWidth(args) {
       return this._command(() => this.core.call("setComponentWidth", args.id, args.width));
-    }
-
-    async exportCircuit() {
-      return this._reporter(async () => JSON.stringify(await this.core.call("exportCircuit")));
     }
 
     async getCircuitData(args) {
@@ -2283,11 +2418,27 @@
       });
     }
 
-    async operateConnection(args) {
-      return this._command(async () => {
-        const method = String(args.action).toUpperCase() === "DISCONNECT" ? "disconnect" : "connect";
-        await this.core.call(method, args.id1, args.port1, args.id2, args.port2);
-      });
+    async createNamedLine(args) {
+      return this._command(() => this.core.call(
+        "createLine",
+        args.lineId,
+        args.id1,
+        args.port1,
+        args.id2,
+        args.port2
+      ));
+    }
+
+    async removeNamedLine(args) {
+      return this._command(() => this.core.call("removeLine", args.lineId));
+    }
+
+    async getLineInfo(args) {
+      return this._reporter(async () => JSON.stringify(await this.core.call("getLineInfo", args.lineId)));
+    }
+
+    async getLines() {
+      return this._reporter(async () => JSON.stringify(await this.core.call("getLines")));
     }
 
     async setInputLevel(args) {
@@ -2296,10 +2447,6 @@
 
     async setInputLevels(args) {
       return this._command(() => this.core.call("setInputs", this._parseJSON(args.json, "输入数据")));
-    }
-
-    async getPort(args) {
-      return this._reporter(() => this.core.call("getPort", args.id, args.port));
     }
 
     async readPorts(args) {
@@ -2312,10 +2459,6 @@
 
     async pulseClock(args) {
       return this._command(() => this.core.call("pulseClock", args.id, args.count));
-    }
-
-    async getGraph() {
-      return this._reporter(async () => JSON.stringify(await this.core.call("exportGraph")));
     }
 
     async loadROM(args) {
@@ -2519,13 +2662,11 @@
   }
 
   root.TuringSimulator = TuringSimulator;
-  root.Bsen975LogicGateEngine = TuringSimulator;
   root.Bsen975LogicGateExtension = Bsen975LogicGateExtension;
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       TuringSimulator,
-      Bsen975LogicGateEngine: TuringSimulator,
       Bsen975LogicGateExtension,
       LogicCoreController,
       LogicOscillationError,
