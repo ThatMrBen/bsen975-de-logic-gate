@@ -7,7 +7,11 @@ const {
   LogicCoreController,
   Bsen975LogicGateExtension,
   CircuitError,
-  COMPONENT_DEFINITIONS
+  COMPONENT_DEFINITIONS,
+  EXTENSION_ID,
+  EXTENSION_SIDEBAR_ICON_URI,
+  EXTENSION_ICON_URI,
+  EXTENSION_COVER_URI
 } = require("./bsen975-de-logic-gate.js");
 
 function addLine(simulator, id1, port1, id2, port2) {
@@ -247,6 +251,94 @@ test("VIA adapts to compatible resizes and isolates conflicting networks", () =>
   assert.deepEqual(changed.disconnected, [{ id: "line-1", from: "source.OUT", to: "via.IO" }]);
   assert.equal(conflicting.getPortWidth("via", "IO"), 4);
   assert.deepEqual(conflicting.exportGraph().connections, [{ id: "line-2", from: "via.IO", to: "sink.IN" }]);
+});
+
+test("merging a VIA into a port atomically rewires named lines and removes the zero-length line", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("input", "LEVEL_INPUT");
+  simulator.addComponent("not-1", "NOT");
+  simulator.addComponent("via-1", "VIA");
+  simulator.addComponent("left", "LEVEL_OUTPUT");
+  simulator.addComponent("right", "LEVEL_OUTPUT");
+  simulator.addComponent("ram", "RAM");
+  simulator.addComponent("rom", "ROM");
+  simulator.createLine("not-input", "input", "OUT", "not-1", "A");
+  simulator.createLine("via-root", "not-1", "OUT", "via-1", "IO");
+  simulator.createLine("left-branch", "via-1", "IO", "left", "IN");
+  simulator.createLine("right-branch", "via-1", "IO", "right", "IN");
+  simulator.setValidationData([{ input: 0 }], [{ left: 1, right: 1 }]);
+  simulator.setPort("input", "OUT", 1);
+  simulator.writeRAM("ram", 7, 91);
+  simulator.loadROM("rom", [37], 4);
+
+  const result = simulator.mergeViaIntoPort("via-1", "not-1", "out");
+
+  assert.deepEqual(result, {
+    viaId: "via-1",
+    target: "not-1.OUT",
+    rewiredLineIds: ["left-branch", "right-branch"],
+    removedLineIds: ["via-root"]
+  });
+  assert.equal(simulator.hasComponent("via-1"), false);
+  assert.deepEqual(simulator.exportCircuit().connections, [
+    { id: "not-input", from: "input.OUT", to: "not-1.A" },
+    { id: "left-branch", from: "not-1.OUT", to: "left.IN" },
+    { id: "right-branch", from: "not-1.OUT", to: "right.IN" }
+  ]);
+  assert.equal(simulator.validationInputVectors.length, 1);
+  assert.equal(simulator.getPort("input", "OUT"), 1);
+  assert.equal(simulator.readMemory("ram", 7), 91);
+  assert.equal(simulator.readMemory("rom", 4), 37);
+  simulator.setPort("input", "OUT", 0);
+  simulator.settle();
+  assert.equal(simulator.getPort("left", "IN"), 1);
+  assert.equal(simulator.getPort("right", "IN"), 1);
+});
+
+test("VIA merge rejects duplicate and direction violations without changing the backend", () => {
+  const duplicate = new TuringSimulator();
+  duplicate.addComponent("source", "LEVEL_INPUT");
+  duplicate.addComponent("via", "VIA");
+  duplicate.addComponent("sink", "LEVEL_OUTPUT");
+  duplicate.createLine("direct", "source", "OUT", "sink", "IN");
+  duplicate.createLine("root", "source", "OUT", "via", "IO");
+  duplicate.createLine("branch", "via", "IO", "sink", "IN");
+  const duplicateBefore = duplicate.exportSnapshot();
+  assert.throws(() => duplicate.mergeViaIntoPort("via", "source", "OUT"), /已存在线路/);
+  assert.deepEqual(duplicate.exportSnapshot(), duplicateBefore);
+
+  const direction = new TuringSimulator();
+  direction.addComponent("source", "LEVEL_INPUT");
+  direction.addComponent("via", "VIA");
+  direction.addComponent("first", "LEVEL_OUTPUT");
+  direction.addComponent("target", "LEVEL_OUTPUT");
+  direction.createLine("driver", "source", "OUT", "via", "IO");
+  direction.createLine("branch", "via", "IO", "first", "IN");
+  const directionBefore = direction.exportSnapshot();
+  assert.throws(() => direction.mergeViaIntoPort("via", "target", "IN"), /方向不兼容/);
+  assert.deepEqual(direction.exportSnapshot(), directionBefore);
+});
+
+test("VIA merge rejects width conflicts and multiple drivers without changing the backend", () => {
+  const width = new TuringSimulator();
+  width.addComponent("source", "LEVEL_INPUT", 4);
+  width.addComponent("via", "VIA");
+  width.addComponent("target", "LEVEL_OUTPUT", 8);
+  width.createLine("wide", "source", "OUT", "via", "IO");
+  const widthBefore = width.exportSnapshot();
+  assert.throws(() => width.mergeViaIntoPort("via", "target", "IN"), /端口位宽不匹配/);
+  assert.deepEqual(width.exportSnapshot(), widthBefore);
+
+  const drivers = new TuringSimulator();
+  drivers.addComponent("first", "LEVEL_INPUT");
+  drivers.addComponent("second", "LEVEL_INPUT");
+  drivers.addComponent("via", "VIA");
+  drivers.addComponent("target-via", "VIA");
+  drivers.createLine("first-driver", "first", "OUT", "via", "IO");
+  drivers.createLine("second-driver", "second", "OUT", "target-via", "IO");
+  const driversBefore = drivers.exportSnapshot();
+  assert.throws(() => drivers.mergeViaIntoPort("via", "target-via", "IO"), /多个驱动端/);
+  assert.deepEqual(drivers.exportSnapshot(), driversBefore);
 });
 
 test("structures require line IDs and component types must be canonical", () => {
@@ -739,6 +831,37 @@ test("extension exposes paced settling and single-case validation blocks", async
   extension.stopCore();
 });
 
+test("extension exposes VIA merge and clears a removed VIA binding", async () => {
+  const extension = new Bsen975LogicGateExtension();
+  const block = extension.getInfo().blocks.find((item) => item.opcode === "mergeViaIntoPort");
+  assert.equal(block.arguments.viaId.defaultValue, "via-1");
+  extension.startCore();
+  const target = { id: "bound-target", isOriginal: true };
+  await extension.registerComponent(
+    { dependency: "SELF", id: "via-1", type: "VIA", width: 1 },
+    { target }
+  );
+  await extension.registerComponent({ dependency: "NONE", id: "source", type: "LEVEL_INPUT", width: 1 });
+  await extension.registerComponent({ dependency: "NONE", id: "sink", type: "LEVEL_OUTPUT", width: 1 });
+  await extension.createNamedLine({
+    lineId: "root", id1: "source", port1: "OUT", id2: "via-1", port2: "IO"
+  });
+  await extension.createNamedLine({
+    lineId: "branch", id1: "via-1", port1: "IO", id2: "sink", port2: "IN"
+  });
+
+  await extension.mergeViaIntoPort({ viaId: "via-1", id: "source", port: "OUT" });
+
+  assert.equal(extension.getLastError(), "");
+  assert.equal(extension.targetBindings.size, 0);
+  assert.equal(extension.componentBindings.size, 0);
+  assert.equal(await extension.hasComponent({ id: "via-1" }), false);
+  assert.deepEqual(JSON.parse(await extension.getLines()), [
+    { id: "branch", from: "source.OUT", to: "sink.IN", width: 1, value: 0, netId: "net-1" }
+  ]);
+  extension.stopCore();
+});
+
 test("local controller serializes asynchronous operations", async () => {
   const controller = new LogicCoreController();
   const events = [];
@@ -764,7 +887,10 @@ test("every visible block has an extension implementation", () => {
   const blocks = info.blocks.filter((block) => block.opcode);
   const buttons = info.blocks.filter((block) => block.func);
 
-  assert.equal(info.name, "BSEN975 Circuit Simulator");
+  assert.equal(info.name, "Circuit Simulator");
+  assert.equal(info.id, EXTENSION_ID);
+  assert.equal(info.blockIconURI, EXTENSION_ICON_URI);
+  assert.equal(info.menuIconURI, EXTENSION_SIDEBAR_ICON_URI);
   assert.ok(blocks.length > 20);
   for (const block of blocks) {
     assert.equal(typeof extension[block.opcode], "function", `missing opcode ${block.opcode}`);
@@ -786,6 +912,29 @@ test("every visible block has an extension implementation", () => {
   assert.deepEqual([...componentTypes].sort(), Object.keys(COMPONENT_DEFINITIONS).sort());
 });
 
+test("extension artwork is embedded as valid Base64 data URIs", () => {
+  assert.match(EXTENSION_SIDEBAR_ICON_URI, /^data:image\/png;base64,/);
+  const sidebarIcon = Buffer.from(EXTENSION_SIDEBAR_ICON_URI.split(",", 2)[1], "base64");
+  assert.equal(sidebarIcon.readUInt32BE(16), 64);
+  assert.equal(sidebarIcon.readUInt32BE(20), 64);
+
+  assert.match(EXTENSION_ICON_URI, /^data:image\/svg\+xml;base64,/);
+  const icon = Buffer.from(EXTENSION_ICON_URI.split(",", 2)[1], "base64").toString("utf8");
+  assert.match(icon, /^<svg\b/);
+  assert.match(icon, />NOT</);
+
+  assert.match(EXTENSION_COVER_URI, /^data:image\/png;base64,/);
+  const cover = Buffer.from(EXTENSION_COVER_URI.split(",", 2)[1], "base64");
+  assert.deepEqual(Array.from(cover.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(cover.readUInt32BE(16), 480);
+  assert.equal(cover.readUInt32BE(20), 302);
+
+  assert.equal(globalThis.tempExt.Extension, Bsen975LogicGateExtension);
+  assert.equal(globalThis.tempExt.info.extensionId, EXTENSION_ID);
+  assert.equal(globalThis.tempExt.info.iconURL, EXTENSION_COVER_URI);
+  assert.equal(globalThis.tempExt.info.insetIconURL, EXTENSION_SIDEBAR_ICON_URI);
+});
+
 test("Simplified Chinese UI uses translations while component types stay canonical", async (context) => {
   const originalScratch = globalThis.Scratch;
   let localeTable = {};
@@ -801,7 +950,7 @@ test("Simplified Chinese UI uses translations while component types stay canonic
 
   const extension = new Bsen975LogicGateExtension();
   const info = extension.getInfo();
-  assert.equal(info.name, "BSEN975 电路模拟器");
+  assert.equal(info.name, "电路模拟器");
   assert.ok(info.blocks.some((block) => block.text === "打开使用指南" && block.func === "openUserGuide"));
   assert.ok(info.blocks.some((block) => block.text === "=== 电路搭建 ==="));
   assert.ok(info.blocks.some((block) => block.text === "启动电路模拟器"));
