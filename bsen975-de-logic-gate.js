@@ -145,6 +145,7 @@
       ports: { D: input(8), CLK: input(1), Q: output(8) },
       sequential: true
     },
+    DELAY: { ports: { IN: input(1), OUT: output(1) }, sequential: true },
     SPLITTER: {
       ports: {
         IN: input(8), B0: output(1), B1: output(1), B2: output(1), B3: output(1),
@@ -183,7 +184,7 @@
   const SCALABLE_PORTS = Object.freeze({
     INPUT: ["OUT"], OUTPUT: ["IN"], LEVEL_INPUT: ["OUT"], LEVEL_OUTPUT: ["IN"],
     SWITCH: ["A", "OUT"], ALWAYS_ON: ["OUT"], ALWAYS_OFF: ["OUT"],
-    NOT: ["A", "OUT"],
+    NOT: ["A", "OUT"], DELAY: ["IN", "OUT"],
     NAND: ["A", "B", "OUT"], AND: ["A", "B", "OUT"], OR: ["A", "B", "OUT"],
     XOR: ["A", "B", "OUT"], NOR: ["A", "B", "OUT"], XNOR: ["A", "B", "OUT"],
     MUX: ["A", "B", "OUT"], AOI: ["A", "B", "C", "OUT"], OAI: ["A", "B", "C", "OUT"],
@@ -253,7 +254,7 @@
         bitWidth,
         definition,
         pins,
-        ...(definition.sequential ? { previousClock: 0 } : {}),
+        ...(definition.ports.CLK ? { previousClock: 0 } : {}),
         memory: definition.memory ? new Uint8Array(256) : null
       };
       this.components.set(normalizedId, component);
@@ -416,7 +417,7 @@
           ));
           if (meta.direction === "output" || hasDriver) component.pins.set(port, current.pins.get(port));
         }
-        if (component.definition.sequential) component.previousClock = current.previousClock;
+        if (own(component, "previousClock")) component.previousClock = current.previousClock;
         if (component.memory) component.memory.set(current.memory);
       }
 
@@ -467,7 +468,7 @@
     resetState() {
       for (const component of this.components.values()) {
         for (const port of component.pins.keys()) component.pins.set(port, 0);
-        if (component.definition.sequential) component.previousClock = 0;
+        if (own(component, "previousClock")) component.previousClock = 0;
         if (component.type === "RAM") component.memory.fill(0);
       }
       for (const net of this.nets.values()) net.value = 0;
@@ -830,7 +831,7 @@
         state: {
           components: Array.from(this.components.values(), (component) => {
             const state = { id: component.id, pins: Object.fromEntries(component.pins) };
-            if (component.definition.sequential) state.previousClock = component.previousClock;
+            if (own(component, "previousClock")) state.previousClock = component.previousClock;
             if (component.memory) state.memory = Array.from(component.memory);
             return state;
           })
@@ -951,7 +952,7 @@
             )
           );
         }
-        if (component.definition.sequential) {
+        if (own(component, "previousClock")) {
           if (!own(state, "previousClock")) {
             throw new CircuitError(
               `快照缺少时钟历史: ${component.id}`,
@@ -1101,6 +1102,10 @@
       const updates = [];
       for (const component of this.components.values()) {
         if (!component.definition.sequential) continue;
+        if (component.type === "DELAY") {
+          updates.push({ component, kind: "delay", value: component.pins.get("IN") });
+          continue;
+        }
         const clock = component.pins.get("CLK");
         const rising = component.previousClock === 0 && clock === 1;
         if (rising && component.type === "REGISTER") {
@@ -1116,7 +1121,10 @@
       }
 
       for (const update of updates) {
-        if (update.kind === "register") {
+        if (update.kind === "delay") {
+          if (update.component.pins.get("OUT") !== update.value) sequentialChanged = true;
+          update.component.pins.set("OUT", update.value);
+        } else if (update.kind === "register") {
           if (update.component.pins.get("Q") !== update.value) sequentialChanged = true;
           update.component.pins.set("Q", update.value);
         } else {
@@ -1125,7 +1133,7 @@
         }
       }
       for (const component of this.components.values()) {
-        if (component.definition.sequential) component.previousClock = component.pins.get("CLK");
+        if (own(component, "previousClock")) component.previousClock = component.pins.get("CLK");
       }
 
       if (sequentialChanged) iterations += this._settleCombinational();
@@ -1594,14 +1602,15 @@
     "help.step2": "添加测试输入、逻辑门和测试输出，并为每个元件设置唯一 ID。",
     "help.step3": "为每条线路填写唯一线路 ID，再按“元件ID.端口”连接，例如 wire-1：input.OUT → gate.A。",
     "help.step4": "设置输入值，再按所需 Hz 执行“传播电路直到稳定”；0 Hz 表示不限速。",
-    "help.step5": "寄存器或 RAM 使用时钟时，执行“让时钟输入产生脉冲”。",
+    "help.step5": "DELAY 使用“模拟电路”按步推进；寄存器或 RAM 使用时钟时，执行“让时钟输入产生脉冲”。",
     "help.step6": "载入测试用例后，可按编号运行单组，也可按指定 Hz 运行全部测试，再从测试结果 JSON 读取结果。",
     "help.rules": "接线规则",
     "help.rule1": "元件 ID 区分大小写，端口名称不区分大小写。",
     "help.rule2": "输出可连接输入，VIA.IO 可连接任意方向；输入不能直连输入，输出不能直连输出。端口位宽必须一致，一个网络只能有一个输出驱动端。",
-    "help.rule3": "未连接的输入默认为 0。组合逻辑传播不会触发寄存器或 RAM；“模拟电路 N 步”始终只推进 N 步。",
+    "help.rule3": "未连接的输入默认为 0。组合逻辑传播不会推进 DELAY，也不会触发寄存器或 RAM；“模拟电路 N 步”始终只推进 N 步。",
     "help.rule4": "测试输入和测试输出会自动成为验证接口；普通外部输入和输出不会。",
     "help.viaRule": "VIA 是只有 IO 一个无源端口的过孔。所有交汇分支连接同一个 VIA.IO；没有 VIA 的几何交叉不会合并网络。",
+    "help.delayRule": "DELAY 有 IN 和 OUT 两个可变位宽端口。每个完整模拟步骤末尾把 IN 锁存到 OUT；多个 DELAY 同时采样，因此串联时每级精确延迟一个 Tick。",
     "help.memoryWiring": "正常运行时，ROM 和 RAM 必须通过 ADDR、DATA、DIN、DOUT、WE、CLK 引脚与其他元件连接。直接装载、读写和清空存储器的积木只用于关卡初始化、存档和调试。",
     "help.testing": "测试数据示例",
     "help.testingNote": "下面的数据验证 input → NOT → output：",
@@ -2222,19 +2231,23 @@
         t("help.step2", "Add Test Input, gates, and Test Output components. Give every component a unique ID."),
         t("help.step3", "Give each line a unique line ID, then connect componentID.port endpoints, for example wire-1: input.OUT → gate.A."),
         t("help.step4", "Set input values, then settle at the requested Hz. Use 0 Hz for unlimited speed."),
-        t("help.step5", "For registers or RAM, pulse the connected clock input."),
+        t("help.step5", "Advance DELAY components with simulate steps. For registers or RAM, pulse the connected clock input."),
         t("help.step6", "Load test cases, then run one numbered case or all cases at the requested Hz and read the result JSON.")
       ], true);
       addHeading(t("help.rules", "Wiring Rules"));
       addList([
         t("help.rule1", "Component IDs are case-sensitive. Port names are case-insensitive."),
         t("help.rule2", "Outputs connect to inputs, while VIA.IO can connect to any direction. Inputs cannot connect directly to inputs, and outputs cannot connect directly to outputs. Widths must match and each net can have only one output driver."),
-        t("help.rule3", "Unconnected inputs default to 0. Settling does not trigger registers or RAM, and simulate N steps always advances exactly N steps."),
+        t("help.rule3", "Unconnected inputs default to 0. Settling does not advance DELAY or trigger registers/RAM, and simulate N steps always advances exactly N steps."),
         t("help.rule4", "Test Input and Test Output automatically become validation interfaces; regular external I/O does not.")
       ]);
       addParagraph(t(
         "help.viaRule",
         "VIA is a junction with one passive IO port. Connect every intersecting branch to the same VIA.IO; geometric crossings without a VIA remain separate nets."
+      ));
+      addParagraph(t(
+        "help.delayRule",
+        "DELAY has scalable IN and OUT ports. At the end of each full simulation step it latches IN to OUT. All DELAY components sample together, so each stage in a chain adds exactly one tick."
       ));
       addParagraph(t(
         "help.memoryWiring",
@@ -2287,6 +2300,7 @@
         ["CONVERTER_4_TO_8", "IN0...IN3", "OUT0...OUT7", "IN: 2; OUT: 1"],
         ["CONVERTER_8_TO_4", "IN0...IN7", "OUT0...OUT3", "IN: 1; OUT: 2"],
         ["REGISTER", "D, CLK", "Q", "D/Q: 8; CLK: 1"],
+        ["DELAY", "IN", "OUT", `IN/OUT: W; ${variableWidth}`],
         ["ROM", "ADDR", "DATA", "ADDR/DATA: 8"],
         ["RAM", "ADDR, DIN, WE, CLK", "DOUT", "ADDR/DIN/DOUT: 8; WE/CLK: 1"],
         ["BUS2_INPUT / BUS2_OUTPUT", `IN / ${none}`, `${none} / OUT`, t("help.busWidth2", "bus: 2")],
@@ -2311,7 +2325,7 @@
         [t("block.running", "circuit simulator running?"), local("检查引擎状态。", "Check engine availability."), local("返回布尔值，不修改状态。", "Returns a Boolean without changing state.")],
         [t("block.lastError", "last error"), local("读取最近失败原因。", "Read the most recent failure."), local("返回本地化错误文字；下一次成功操作会清空它。", "Returns a localized message; the next successful operation clears it.")],
         [t("block.clear", "clear current circuit"), local("删除当前电路。", "Delete the current circuit."), local("移除全部元件、连线、测试数据和绑定。", "Removes all components, wires, test data, and bindings.")],
-        [t("block.reset", "reset circuit state"), local("重新初始化运行状态。", "Reinitialize runtime state."), local("保留元件和连线；清零引脚、寄存器和 RAM，保留 ROM。", "Keeps components and wires; clears pins, registers, and RAM while preserving ROM.")],
+        [t("block.reset", "reset circuit state"), local("重新初始化运行状态。", "Reinitialize runtime state."), local("保留元件和连线；清零引脚、DELAY、寄存器和 RAM，保留 ROM。", "Keeps components and wires; clears pins, DELAY stages, registers, and RAM while preserving ROM.")],
         [t("block.add", "add [type] component ID [id] width [width] bind to [dependency]"), local("创建一个元件实例。", "Create a component instance."), local("加入指定 ID 和类型；普通可变宽度元件使用所选位宽，VIA 忽略该参数并自动适应线路。LEVEL 接口自动加入测试。", "Adds the selected ID and type; regular scalable components use the selected width, while VIA ignores it and adapts to its net. LEVEL interfaces join validation.")],
         [t("block.remove", "remove component ID [id]"), local("删除一个元件。", "Delete one component."), local("同时移除其连线、测试接口登记和角色绑定。", "Also removes its wires, validation-interface entry, and target binding.")],
         [t("block.exists", "component ID [id] exists?"), local("检查 ID 是否已使用。", "Check whether an ID is in use."), local("返回布尔值，不修改电路。", "Returns a Boolean without changing the circuit.")],
@@ -2323,17 +2337,17 @@
         [t("block.componentIds", "all component IDs JSON"), local("枚举电路元件。", "Enumerate circuit components."), local("返回按添加顺序排列的 ID 数组 JSON。", "Returns a JSON array of IDs in insertion order.")],
         [t("block.ports", "ports of component [id] JSON"), local("检查元件全部引脚。", "Inspect every pin on a component."), local("返回名称、方向、位宽、当前值和连接状态。", "Returns name, direction, width, current value, and connection state.")],
         [t("block.setWidth", "set component [id] width to [width]"), local("修改可变宽度元件。", "Resize a scalable component."), local("更新普通数据引脚到 1/2/4/8 位并断开不兼容连线；VIA 不支持手动修改。", "Changes regular data pins to 1/2/4/8 bits and disconnects incompatible wires; VIA cannot be resized manually.")],
-        [t("block.circuitData", "current circuit [kind] JSON"), local("导出结构、调试状态或完整快照。", "Export structure, debug state, or a full snapshot."), local("结构用于模板；运行状态用于观察信号；快照还保存 RAM、ROM、寄存器和时钟历史。", "Structure is for templates, runtime state observes signals, and snapshots also preserve RAM, ROM, registers, and clock history.")],
+        [t("block.circuitData", "current circuit [kind] JSON"), local("导出结构、调试状态或完整快照。", "Export structure, debug state, or a full snapshot."), local("结构用于模板；运行状态用于观察信号；快照还保存 DELAY、RAM、ROM、寄存器和时钟历史。", "Structure is for templates, runtime state observes signals, and snapshots also preserve DELAY, RAM, ROM, registers, and clock history.")],
         [t("block.import", "import circuit structure or snapshot JSON [json]"), local("载入已保存的结构或快照。", "Load a saved structure or snapshot."), local("完整校验后原子替换电路，并清除旧绑定和测试数据；失败时保留原电路。", "Atomically replaces the circuit after full validation and clears bindings/tests; failure preserves the old circuit.")],
         [t("block.setInput", "set input [id] to [value]"), local("设置单个外部输入。", "Set one external input."), local("只修改输入源 OUT；需要随后传播或产生时钟。", "Changes only the source OUT pin; settle or pulse afterward.")],
         [t("block.setInputs", "set inputs from JSON [json]"), local("一次设置多个输入。", "Set multiple inputs at once."), local("按 ID 写入所有给定输入；不会自动传播。", "Writes every supplied input by ID without settling automatically.")],
         [t("block.portProperty", "[property] of port [id].[port]"), local("查询单个引脚的值或位宽。", "Read one pin's value or width."), local("返回一个数字，不修改电路。", "Returns a number without changing the circuit.")],
         [t("block.readPorts", "read ports from JSON [json]"), local("批量读取引脚值。", "Read several pin values."), local("返回以“元件ID.端口”为键的对象 JSON。", "Returns a JSON object keyed by componentID.port.")],
-        [t("block.settle", "settle circuit until stable at [hz] Hz"), local("按指定频率传播组合逻辑。", "Propagate combinational logic at the requested rate."), local("计算到稳定或报告振荡；Hz 限制传播节拍，0 表示不限速；不会采样寄存器和 RAM 上升沿。", "Runs until stable or reports oscillation; Hz limits propagation pacing, 0 is unlimited, and register/RAM edges are not sampled.")],
-        [t("block.pulse", "pulse clock input [id] [count] times"), local("产生完整时钟脉冲。", "Generate complete clock pulses."), local("每次执行低电平传播再执行上升沿传播，触发寄存器和 WE=1 的 RAM，最终 CLK 为 1。", "Each pulse settles low then rising high, triggering registers and WE=1 RAM; CLK ends high.")],
-        [t("block.steps", "simulate circuit for [ticks] steps (advanced)"), local("精确推进指定数量的完整模拟步骤。", "Advance exactly the requested number of full simulation steps."), local("只执行 ticks 步；每步先稳定组合逻辑，再采样当前 CLK 上升沿，不会在后台继续运行。", "Runs exactly ticks steps; each settles combinational logic then samples CLK edges, with no background execution.")],
+        [t("block.settle", "settle circuit until stable at [hz] Hz"), local("按指定频率传播组合逻辑。", "Propagate combinational logic at the requested rate."), local("计算到稳定或报告振荡；Hz 限制传播节拍，0 表示不限速；不会推进 DELAY 或采样寄存器/RAM 上升沿。", "Runs until stable or reports oscillation; Hz limits propagation pacing, 0 is unlimited, and DELAY/register/RAM state is not advanced.")],
+        [t("block.pulse", "pulse clock input [id] [count] times"), local("产生完整时钟脉冲。", "Generate complete clock pulses."), local("每次执行低、高两个完整步骤，触发寄存器和 WE=1 的 RAM；DELAY 因而推进两次，最终 CLK 为 1。", "Each pulse runs low and high as two full steps, triggers registers and WE=1 RAM, advances DELAY twice, and ends with CLK high.")],
+        [t("block.steps", "simulate circuit for [ticks] steps (advanced)"), local("精确推进指定数量的完整模拟步骤。", "Advance exactly the requested number of full simulation steps."), local("每步先稳定组合逻辑，再让全部 DELAY 同时锁存并采样当前 CLK 上升沿；不会在后台继续运行。", "Each step settles combinational logic, latches all DELAY stages together, then samples CLK edges; no background execution continues.")],
         [t("block.loadTests", "load test cases inputs [inputs] expected [expected] mode [mode]"), local("保存输入、期望向量和状态模式。", "Store input vectors, expected vectors, and state mode."), local("每组重置会在用例前清寄存器/RAM；连续模式按顺序保留时序状态。", "Reset mode clears registers/RAM before each case; preserve mode carries sequential state forward.")],
-        [t("block.runCase", "run test case [caseNumber] at [hz] Hz"), local("只执行指定编号的已载入测试。", "Execute one loaded test case by number."), local("按载入时选择的状态模式处理该组，写输入、传播并比较 LEVEL_OUTPUT；结果 JSON 的 total 为 1。", "Applies the loaded state mode, writes inputs, settles, and compares LEVEL_OUTPUT; result JSON has total 1.")],
+        [t("block.runCase", "run test case [caseNumber] at [hz] Hz"), local("只执行指定编号的已载入测试。", "Execute one loaded test case by number."), local("按状态模式处理该组，写输入、推进一个含 DELAY 的完整步骤并比较 LEVEL_OUTPUT；结果 total 为 1。", "Applies the state mode, writes inputs, advances one full step including DELAY, and compares LEVEL_OUTPUT; result total is 1.")],
         [t("block.runTests", "run all test cases at [hz] Hz"), local("按指定频率执行全部已载入测试。", "Execute all loaded tests at the requested rate."), local("每个用例占一个验证节拍；0 Hz 表示不限速。按顺序比较输出，并保留最后一组状态。", "Each case consumes one validation tick; 0 Hz is unlimited. Cases run in order and leave the final state.")],
         [t("block.testResult", "test result JSON"), local("读取最近测试报告。", "Read the latest test report."), local("返回通过数、总数和每个失败差异的 JSON。", "Returns JSON with pass count, total, and per-case differences.")],
         [t("block.loadRom", "load data JSON [data] into ROM [id] at address [offset]"), local("在关卡开始前初始化 ROM 字节。", "Initialize ROM bytes before circuit execution."), local("这是后端装载接口，不是电路信号；运行时仍由相连的 ADDR 引脚选择、DATA 引脚输出。", "This is a backend loading interface, not a signal; during execution, connected ADDR selects data exposed through DATA.")],

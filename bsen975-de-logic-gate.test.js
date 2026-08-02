@@ -480,6 +480,60 @@ test("settling and clock pulses have distinct sequential behavior", () => {
   assert.equal(simulator.getPort("register", "Q"), 37);
 });
 
+test("DELAY advances exactly one stage per tick and supports scalable widths", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT", 4);
+  simulator.addComponent("first", "DELAY", 4);
+  simulator.addComponent("second", "DELAY", 4);
+  simulator.addComponent("output", "LEVEL_OUTPUT", 4);
+  addLine(simulator, "source", "OUT", "first", "IN");
+  addLine(simulator, "first", "OUT", "second", "IN");
+  addLine(simulator, "second", "OUT", "output", "IN");
+
+  assert.equal(simulator.getPortWidth("first", "IN"), 4);
+  assert.equal(simulator.getPortWidth("first", "OUT"), 4);
+  simulator.setPort("source", "OUT", 9);
+  simulator.settle();
+  assert.equal(simulator.getPort("first", "IN"), 9);
+  assert.equal(simulator.getPort("first", "OUT"), 0);
+  assert.equal(simulator.getPort("output", "IN"), 0);
+
+  simulator.tick();
+  assert.equal(simulator.getPort("first", "OUT"), 9);
+  assert.equal(simulator.getPort("second", "OUT"), 0);
+  simulator.tick();
+  assert.equal(simulator.getPort("output", "IN"), 9);
+
+  simulator.setPort("source", "OUT", 3);
+  simulator.settle();
+  assert.equal(simulator.getPort("output", "IN"), 9);
+  simulator.tick(2);
+  assert.equal(simulator.getPort("output", "IN"), 3);
+});
+
+test("DELAY state resets and round-trips through snapshots without clock history", () => {
+  const simulator = new TuringSimulator();
+  simulator.addComponent("source", "LEVEL_INPUT", 2);
+  simulator.addComponent("delay", "DELAY", 2);
+  simulator.addComponent("output", "LEVEL_OUTPUT", 2);
+  addLine(simulator, "source", "OUT", "delay", "IN");
+  addLine(simulator, "delay", "OUT", "output", "IN");
+  simulator.setPort("source", "OUT", 3);
+  simulator.tick();
+
+  const snapshot = simulator.exportSnapshot();
+  const delayState = snapshot.state.components.find(({ id }) => id === "delay");
+  assert.equal(delayState.pins.OUT, 3);
+  assert.equal(Object.hasOwn(delayState, "previousClock"), false);
+
+  const restored = new TuringSimulator();
+  restored.importCircuit(snapshot);
+  assert.equal(restored.getPort("output", "IN"), 3);
+  restored.resetState();
+  assert.equal(restored.getPort("delay", "OUT"), 0);
+  assert.equal(restored.getPort("output", "IN"), 0);
+});
+
 test("reset clears runtime state while preserving topology and ROM", () => {
   const simulator = new TuringSimulator();
   simulator.addComponent("rom", "ROM");
@@ -1073,6 +1127,7 @@ test("user guide button creates and closes an offline guide dialog", (context) =
   assert.match(allText(dialog), /Component Pin Reference/);
   assert.match(allText(dialog), /Block Behavior and Results/);
   assert.match(allText(dialog), /REGISTER/);
+  assert.match(allText(dialog), /DELAY/);
   assert.match(allText(dialog), /D\/Q: 8; CLK: 1/);
 
   const closeButton = dialog.children
