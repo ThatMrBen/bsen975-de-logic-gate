@@ -806,7 +806,7 @@ test("dependency menu can bind a component to another target", async (context) =
 test("extension errors are English by default", async () => {
   const extension = new Bsen975LogicGateExtension();
   await extension.getPortProperty({ id: "missing", port: "OUT", property: "VALUE" });
-  assert.equal(extension.getLastError(), "The circuit simulator is not running");
+  assert.equal(extension.getLastError(), "The circuit simulation is not running");
   extension.startCore();
   await extension.registerComponent({ dependency: "NONE", id: "bad", type: "UNKNOWN", width: 1 });
   assert.equal(extension.getLastError(), "Unknown component type: UNKNOWN");
@@ -941,7 +941,8 @@ test("every visible block has an extension implementation", () => {
   const blocks = info.blocks.filter((block) => block.opcode);
   const buttons = info.blocks.filter((block) => block.func);
 
-  assert.equal(info.name, "Circuit Simulator");
+  assert.equal(info.name, "circuit simulation");
+  assert.equal(EXTENSION_ID, "bsen975-circuit-simulation");
   assert.equal(info.id, EXTENSION_ID);
   assert.equal(info.blockIconURI, EXTENSION_ICON_URI);
   assert.equal(info.menuIconURI, EXTENSION_SIDEBAR_ICON_URI);
@@ -985,6 +986,8 @@ test("extension artwork is embedded as valid Base64 data URIs", () => {
 
   assert.equal(globalThis.tempExt.Extension, Bsen975LogicGateExtension);
   assert.equal(globalThis.tempExt.info.extensionId, EXTENSION_ID);
+  assert.equal(globalThis.tempExt.l10n["zh-cn"][`${EXTENSION_ID}.name`], "电路模拟器");
+  assert.equal(globalThis.tempExt.l10n.en[`${EXTENSION_ID}.name`], "circuit simulation");
   assert.equal(globalThis.tempExt.info.iconURL, EXTENSION_COVER_URI);
   assert.equal(globalThis.tempExt.info.insetIconURL, EXTENSION_SIDEBAR_ICON_URI);
 });
@@ -1118,11 +1121,11 @@ test("user guide button creates and closes an offline guide dialog", (context) =
 
   const extension = new Bsen975LogicGateExtension();
   assert.equal(extension.openUserGuide(), "");
-  const dialog = fakeDocument.getElementById("bsen975-logic-gate-guide");
+  const dialog = fakeDocument.getElementById("bsen975-circuit-simulation-guide");
   assert.ok(dialog);
   assert.equal(dialog.open, true);
   const allText = (element) => element.textContent + element.children.map(allText).join("");
-  assert.match(allText(dialog), /Circuit Simulator User Guide/);
+  assert.match(allText(dialog), /circuit simulation user guide/);
   assert.match(allText(dialog), /input\.OUT/);
   assert.match(allText(dialog), /Component Pin Reference/);
   assert.match(allText(dialog), /Block Behavior and Results/);
@@ -1135,5 +1138,5 @@ test("user guide button creates and closes an offline guide dialog", (context) =
     .find((child) => child.tagName === "BUTTON");
   assert.ok(closeButton);
   closeButton.dispatch("click");
-  assert.equal(fakeDocument.getElementById("bsen975-logic-gate-guide"), null);
+  assert.equal(fakeDocument.getElementById("bsen975-circuit-simulation-guide"), null);
 });

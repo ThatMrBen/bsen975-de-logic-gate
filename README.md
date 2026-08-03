@@ -1,7 +1,8 @@
-# bsen975-de-logic-gate
+# 电路模拟器
 
 Gandi/TurboWarp 非沙盒逻辑门扩展。界面语言跟随 Scratch/TurboWarp：英文名称为
-`BSEN975 Circuit Simulator`，简体中文名称为 `BSEN975 电路模拟器`。
+扩展英文名为 `circuit simulation`，简体中文名称为 `电路模拟器`，扩展 ID 为
+`bsen975-circuit-simulation`。
 
 扩展源码内嵌了 Base64 Data URI 格式的扩展库封面和 NOT 门图标，不依赖外部图片文件；
 侧栏使用单独展平的方形 PNG，积木左侧使用 SVG，封面通过 Gandi 扩展库元数据提供。
